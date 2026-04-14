@@ -215,6 +215,13 @@ int main(int argc, char **argv) {
      * context by default — we don't pass one. */
     NVFBC_CREATE_HANDLE_PARAMS ch;
     memset(&ch, 0, sizeof(ch));
+
+    // Set privateData to allow NvFBC on consumer NVIDIA GPUs.
+    // Based on https://github.com/keylase/nvidia-patch/blob/3193b4b1cea91527bf09ea9b8db5aade6a3f3c0a/win/nvfbcwrp/nvfbcwrp_main.cpp#L23-L25 .
+    const unsigned int MAGIC_PRIVATE_DATA[4] = { 0xAEF57AC5, 0x401D1A39, 0x1B856BBE, 0x9ED0CEBA };
+    ch.privateData = MAGIC_PRIVATE_DATA;
+    ch.privateDataSize = sizeof(MAGIC_PRIVATE_DATA);
+
     ch.dwVersion = NVFBC_CREATE_HANDLE_PARAMS_VER;
     st = g_fn.nvFBCCreateHandle(&g_session, &ch);
     if (st != NVFBC_SUCCESS) {
