@@ -46,7 +46,8 @@ class FrameType(IntEnum):
     VIDEO_H264 = 0x03       # H.264 NAL unit
     VIDEO_H265 = 0x04       # H.265 NAL unit
     VIDEO_AV1 = 0x05        # AV1 OBU frame
-    AUDIO = 0x10            # Audio frame
+    AUDIO = 0x10            # Audio frame (server → client)
+    MIC = 0x11              # Microphone audio frame (client → server)
 
 
 class VideoCodec(IntEnum):
@@ -77,6 +78,7 @@ class VideoFrameFlags(IntEnum):
 # Binary headers
 VIDEO_HEADER_SIZE = 10  # type(1) + codec(1) + chroma(1) + flags(1) + timestamp(4) + monitor(2)
 AUDIO_HEADER_SIZE = 8   # type(1) + codec(1) + reserved(2) + timestamp(4)
+MIC_HEADER_SIZE = 8     # type(1) + codec(1) + reserved(2) + timestamp(4)  [same layout as AUDIO]
 JPEG_HEADER_SIZE = 9    # type(1) + x(2) + y(2) + w(2) + h(2) — legacy compat
 
 
@@ -101,6 +103,17 @@ def decode_audio_header(data: bytes) -> tuple:
     """Returns (codec, timestamp_ms, payload)"""
     _, codec, _, ts = struct.unpack("!BBHI", data[:AUDIO_HEADER_SIZE])
     return AudioCodec(codec), ts, data[AUDIO_HEADER_SIZE:]
+
+
+def encode_mic_header(codec: AudioCodec, timestamp_ms: int) -> bytes:
+    """Encode microphone frame header (client → server)."""
+    return struct.pack("!BBHI", FrameType.MIC, codec, 0, timestamp_ms)
+
+
+def decode_mic_header(data: bytes) -> tuple:
+    """Returns (codec, timestamp_ms, payload)"""
+    _, codec, _, ts = struct.unpack("!BBHI", data[:MIC_HEADER_SIZE])
+    return AudioCodec(codec), ts, data[MIC_HEADER_SIZE:]
 
 
 # Legacy JPEG frame compat

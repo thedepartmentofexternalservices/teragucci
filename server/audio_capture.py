@@ -62,22 +62,22 @@ class AudioCapture:
             os.initgroups(pwd.getpwuid(self._uid).pw_name, self._gid)
             os.setuid(self._uid)
 
+    # Sink names that belong to mic injection — never capture these as system audio
+    _MIC_SINK_NAMES = ("mic", "teraguchi_mic")
+
     def _find_monitor_source(self) -> str:
-        """Find the PulseAudio monitor source for capturing system audio."""
+        """Find the PulseAudio monitor source for capturing system audio.
+
+        Priority:
+          1. teraguchi_audio.monitor  — our dedicated system-audio sink
+          2. auto_null.monitor        — PipeWire/PA fallback
+          3. Any other .monitor that is not mic-related
+        """
         demote = self._demote if self._uid else None
-        try:
-            proc = subprocess.run(
-                ["pactl", "get-default-sink"],
-                capture_output=True, text=True, timeout=5,
-                env=self._pulse_env, preexec_fn=demote,
-            )
-            if proc.returncode == 0:
-                sink = proc.stdout.strip()
-                source = f"{sink}.monitor"
-                logger.info("Found audio monitor source: %s", source)
-                return source
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+
+        def _is_mic_monitor(name: str) -> bool:
+            n = name.lower()
+            return any(m in n for m in self._MIC_SINK_NAMES)
 
         try:
             proc = subprocess.run(
@@ -85,55 +85,55 @@ class AudioCapture:
                 capture_output=True, text=True, timeout=5,
                 env=self._pulse_env, preexec_fn=demote,
             )
-            for line in proc.stdout.strip().split("\n"):
-                if ".monitor" in line:
-                    parts = line.split("\t")
-                    if len(parts) >= 2:
-                        logger.info("Found audio monitor source: %s", parts[1])
-                        return parts[1]
+            monitors = []
+            for line in proc.stdout.strip().splitlines():
+                if ".monitor" not in line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                name = parts[1]
+                if not _is_mic_monitor(name):
+                    monitors.append(name)
+
+            # Prefer our dedicated sink, then auto_null, then anything else
+            for preferred in ("teraguchi_audio.monitor", "auto_null.monitor"):
+                if preferred in monitors:
+                    logger.info("Found audio monitor source: %s", preferred)
+                    return preferred
+            if monitors:
+                logger.info("Found audio monitor source: %s", monitors[0])
+                return monitors[0]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-        logger.warning("No PulseAudio monitor source found, audio disabled")
+        logger.warning("No suitable PulseAudio monitor source found, audio disabled")
         return ""
 
     @property
     def available(self) -> bool:
         return bool(self._source)
 
-    def start(self, on_audio_frame: Callable):
-        """
-        Start capturing audio.
-
-        Args:
-            on_audio_frame: Callback(opus_bytes, timestamp_ms) called from reader thread.
-        """
-        if not self._source:
-            logger.warning("Audio capture not available (no monitor source)")
-            return
-
-        self._on_audio_frame = on_audio_frame
-        self._running = True
-
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            # PulseAudio input
-            "-f", "pulse",
-            "-i", self._source,
-            # Output raw PCM for simplest client-side playback
+    def _build_ffmpeg_cmd(self) -> list:
+        return [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "pulse", "-i", self._source,
             "-c:a", "pcm_s16le",
             "-ar", str(self.sample_rate),
             "-ac", str(self.channels),
-            "-f", "s16le",
-            "pipe:1",
+            "-f", "s16le", "pipe:1",
         ]
 
-        logger.info("Starting audio capture: %s", " ".join(cmd))
-
+    def _launch_ffmpeg(self) -> bool:
+        """Spawn the ffmpeg process. Returns True on success."""
+        # Re-query source in case PipeWire reassigned sinks
+        self._source = self._find_monitor_source()
+        if not self._source:
+            return False
         try:
             demote = self._demote if self._uid else None
+            cmd = self._build_ffmpeg_cmd()
+            logger.info("Starting audio capture: %s", " ".join(cmd))
             self._process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -143,8 +143,18 @@ class AudioCapture:
                 env=self._pulse_env,
                 preexec_fn=demote,
             )
+            return True
         except FileNotFoundError:
             logger.error("FFmpeg not found, audio capture disabled")
+            return False
+
+    def start(self, on_audio_frame: Callable):
+        """Start capturing audio.  Spawns ffmpeg and a reader/watchdog thread."""
+        self._on_audio_frame = on_audio_frame
+        self._running = True
+
+        if not self._launch_ffmpeg():
+            logger.warning("Audio capture not available (no monitor source)")
             self._running = False
             return
 
@@ -156,22 +166,49 @@ class AudioCapture:
         self._reader_thread.start()
 
     def _read_audio(self):
-        """Read encoded audio data from FFmpeg stdout."""
-        try:
+        """Read PCM from ffmpeg stdout.  Auto-restarts ffmpeg if it dies."""
+        chunk_size = self.sample_rate * self.channels * 2 * 20 // 1000  # 20ms
+        backoff = 1.0
+
+        while self._running:
+            # --- read loop for the current process ---
             while self._running and self._process and self._process.poll() is None:
-                # Read in chunks matching roughly 20ms of Opus at our bitrate
-                chunk_size = self.sample_rate * self.channels * 2 * 20 // 1000  # 20ms of PCM
-                data = self._process.stdout.read(chunk_size)
+                try:
+                    data = self._process.stdout.read(chunk_size)
+                except Exception as e:
+                    if self._running:
+                        logger.error("Audio read error: %s", e)
+                    break
                 if not data:
                     break
-
-                timestamp_ms = int(time.time() * 1000)
+                backoff = 1.0  # successful read — reset backoff
+                ts = int(time.time() * 1000)
                 if self._on_audio_frame:
-                    self._on_audio_frame(data, timestamp_ms)
+                    self._on_audio_frame(data, ts)
 
-        except Exception as e:
-            if self._running:
-                logger.error("Audio reader error: %s", e)
+            if not self._running:
+                break
+
+            # ffmpeg died — log stderr and restart with backoff
+            if self._process:
+                try:
+                    stderr = self._process.stderr.read().decode(errors="replace").strip()
+                    if stderr:
+                        logger.warning("Audio ffmpeg exited: %s", stderr[:200])
+                except Exception:
+                    pass
+                try:
+                    self._process.wait(timeout=1)
+                except Exception:
+                    pass
+                self._process = None
+
+            logger.info("Audio capture: restarting in %.0fs", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+            if not self._launch_ffmpeg():
+                logger.warning("Audio capture: no monitor source, will retry")
 
     def update_bitrate(self, bitrate_kbps: int):
         """Update audio bitrate (requires restart)."""

@@ -33,6 +33,7 @@ class FullscreenToolbar(QWidget):
     exit_fullscreen = Signal()
     disconnect_requested = Signal()
     settings_requested = Signal()
+    mic_toggle_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +89,33 @@ class FullscreenToolbar(QWidget):
         layout.addWidget(self._monitor_selector)
 
         layout.addStretch()
+
+        # Audio receiving indicator
+        self._audio_dot = QLabel()
+        self._audio_dot.setFixedSize(8, 8)
+        self._audio_dot.setStyleSheet(
+            f"border-radius: 4px; background: {theme.TEXT_MUTED};")
+        self._audio_dot.setToolTip("Remote audio")
+        layout.addWidget(self._audio_dot)
+
+        self._audio_label = QLabel("audio")
+        self._audio_label.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        layout.addWidget(self._audio_label)
+
+        layout.addSpacing(8)
+
+        # Mic toggle button
+        from client import icons as _icons
+        self._mic_btn = QPushButton()
+        self._mic_btn.setFixedSize(30, 30)
+        self._mic_btn.setCheckable(True)
+        self._mic_btn.setToolTip("Mute/unmute microphone")
+        self._mic_btn.setIcon(_icons.icon_mic())
+        self._mic_btn.clicked.connect(self.mic_toggle_requested.emit)
+        layout.addWidget(self._mic_btn)
+
+        layout.addSpacing(8)
 
         # Health summary
         self._health_dot = QLabel()
@@ -191,3 +219,24 @@ class FullscreenToolbar(QWidget):
     @property
     def monitor_selector(self):
         return self._monitor_selector
+
+    def update_mic_state(self, active: bool, device_name: str = ""):
+        """Update mic button appearance. active=True means mic is on (not muted)."""
+        from client import icons as _icons
+        self._mic_btn.setChecked(not active)  # checked = muted
+        if active:
+            self._mic_btn.setIcon(_icons.icon_mic(theme.ACCENT))
+            tip = f"Mic: {device_name}" if device_name else "Mic: active"
+        else:
+            self._mic_btn.setIcon(_icons.icon_mic_muted())
+            tip = "Mic: muted (click to unmute)"
+        self._mic_btn.setToolTip(tip)
+
+    def update_audio_state(self, receiving: bool):
+        """Update audio dot: green if server is sending audio, grey otherwise."""
+        color = theme.ACCENT if receiving else theme.TEXT_MUTED
+        self._audio_dot.setStyleSheet(f"border-radius: 4px; background: {color};")
+        self._audio_label.setStyleSheet(
+            f"color: {'#00c878' if receiving else theme.TEXT_MUTED}; font-size: 11px;"
+        )
+        self._audio_label.setToolTip("Remote audio: receiving" if receiving else "Remote audio: none")

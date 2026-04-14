@@ -24,14 +24,17 @@ class AudioPlayer:
     """
     Plays raw PCM s16le audio from the Teraguchi server.
 
-    Keeps latency low (~100ms) by using a small Qt audio buffer
-    and skipping frames if the buffer gets too full.
+    Uses processedUSecs() for reliable latency tracking on macOS (where
+    bytesFree() is unreliable with wireless devices like Apple Vision Pro).
+    Drops frames only when far behind, and never mid-chunk to avoid cracks.
     """
 
-    # Target latency in milliseconds
-    TARGET_LATENCY_MS = 100
-    # Max buffered audio before we skip frames (ms)
-    MAX_BUFFER_MS = 200
+    # How much audio to buffer ahead of hardware playback.
+    # 400ms works for AVP and other wireless/Bluetooth outputs.
+    TARGET_LATENCY_MS = 400
+    # Drop incoming frames only when this far ahead — avoids cracks from
+    # abrupt PCM discontinuities on wireless devices.
+    MAX_BUFFER_MS = 1200
 
     def __init__(self, sample_rate: int = 48000, channels: int = 2):
         self.sample_rate = sample_rate
@@ -40,6 +43,7 @@ class AudioPlayer:
         self._io_device: Optional[QIODevice] = None
         self._started = False
         self._frame_count = 0
+        self._bytes_written = 0
         # Bytes per millisecond of audio
         self._bytes_per_ms = sample_rate * channels * 2 // 1000
 
@@ -78,29 +82,31 @@ class AudioPlayer:
 
     def feed(self, codec: int, timestamp_ms: int, data: bytes):
         """Feed a raw PCM audio chunk from the server."""
-        if not self._started or not self._io_device:
+        if not self._started or not self._io_device or not self._sink:
             return
 
         self._frame_count += 1
 
-        # Check how much is already buffered
-        if self._sink:
-            buf_size = self._sink.bufferSize()
-            free = self._sink.bytesFree()
-            buffered = buf_size - free
-            buffered_ms = buffered // self._bytes_per_ms
+        # processedUSecs() is reliable on macOS (unlike bytesFree()).
+        # It returns microseconds of audio already sent to hardware.
+        played_ms = self._sink.processedUSecs() // 1000
+        written_ms = self._bytes_written // self._bytes_per_ms
+        buffered_ms = written_ms - played_ms
 
-            # If too far behind, skip this frame to catch up
-            if buffered_ms > self.MAX_BUFFER_MS:
-                if self._frame_count % 100 == 0:
-                    logger.debug("Audio buffer full (%dms), skipping", buffered_ms)
-                return
+        if buffered_ms > self.MAX_BUFFER_MS:
+            # Too far ahead — drop this whole chunk cleanly (no mid-chunk cut)
+            if self._frame_count % 50 == 0:
+                logger.debug("Audio ahead by %dms, dropping frame", buffered_ms)
+            return
 
-        self._io_device.write(QByteArray(data))
+        written = self._io_device.write(QByteArray(data))
+        if written > 0:
+            self._bytes_written += written
 
     def stop(self):
         """Stop audio playback."""
         self._started = False
+        self._bytes_written = 0
         if self._sink:
             self._sink.stop()
             self._sink = None

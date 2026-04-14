@@ -588,6 +588,7 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self._quality_panel = QualityControlPanel()
         self._quality_panel.settings_changed.connect(self._on_quality_changed)
+        self._quality_panel.mic_mute_toggled.connect(self._toggle_mic)
         self._quality_dock.setWidget(self._quality_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self._quality_dock)
         self._quality_dock.hide()
@@ -625,6 +626,7 @@ class MainWindow(QMainWindow):
         self._fs_toolbar.settings_requested.connect(
             lambda: self._quality_dock.setVisible(not self._quality_dock.isVisible()))
         self._fs_toolbar.monitor_selector.selection_changed.connect(self._on_monitors_changed)
+        self._fs_toolbar.mic_toggle_requested.connect(self._toggle_mic)
         self._fs_toolbar.hide()
 
         # ── Timers ──
@@ -681,6 +683,9 @@ class MainWindow(QMainWindow):
             "Refresh Frame", "F5",
             lambda: self._active_session and self._active_session.request_full_frame(),
             icons.icon_refresh()))
+        conn_menu.addSeparator()
+        conn_menu.addAction(self._action(
+            "Mute/Unmute Mic", "M", self._toggle_mic, icons.icon_mic()))
 
         # View menu
         view_menu = mb.addMenu("&View")
@@ -737,6 +742,15 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._monitor_selector)
 
         tb.addSeparator()
+
+        # Mic toggle — icon changes based on state
+        self._mic_action = self._action(
+            "Mute Mic", "M", self._toggle_mic, icons.icon_mic())
+        self._mic_action.setCheckable(True)
+        self._mic_action.setToolTip("Microphone: active (click to mute)")
+        tb.addAction(self._mic_action)
+
+        tb.addSeparator()
         tb.addAction(self._action(
             "Settings", "", lambda: self._quality_dock.setVisible(
                 not self._quality_dock.isVisible()), icons.icon_settings()))
@@ -788,6 +802,7 @@ class MainWindow(QMainWindow):
         session.usb_devices_updated.connect(self._on_usb_devices_updated)
         session.broker_machine_needed.connect(
             lambda machines, s=session: self._on_broker_machine_needed(s, machines))
+        session.mic_state_changed.connect(self._on_mic_state_changed)
 
         if mode == "broker":
             logger.info("Connecting via broker to %s:%d", host, port)
@@ -833,6 +848,9 @@ class MainWindow(QMainWindow):
             self._status_label.setText(session.display_name)
             if self.isFullScreen():
                 self._fs_toolbar.set_connection_label(session.display_name)
+            # Sync mic UI to newly selected session
+            self._on_mic_state_changed(
+                session.mic_available and not session.mic_muted)
 
     def _on_session_status(self, idx, status):
         session = self._sessions.get(idx)
@@ -902,6 +920,52 @@ class MainWindow(QMainWindow):
             profile.host, profile.port, profile.username, password,
             use_tls=profile.use_tls, auto_reconnect=profile.auto_connect,
             bookmark_id=bookmark_id, mode=mode)
+
+    def _active_bookmark_ids(self) -> set:
+        """Return the set of bookmark IDs that currently have a connected session."""
+        return {
+            s._bookmark_id
+            for s in self._sessions.values()
+            if s._bookmark_id and s.is_connected
+        }
+
+    def _disconnect_by_bookmark_id(self, bookmark_id: str):
+        """Disconnect the session associated with a specific bookmark ID."""
+        for idx, session in list(self._sessions.items()):
+            if session._bookmark_id == bookmark_id:
+                if self.isFullScreen():
+                    self._toggle_fullscreen()
+                self._close_tab(idx)
+                return
+
+    def _toggle_mic(self):
+        """Mute or unmute the microphone on the active session."""
+        s = self._active_session
+        if s:
+            s.toggle_mic()
+
+    def _on_mic_state_changed(self, active: bool):
+        """Update all mic UI when the session mic state changes."""
+        s = self._active_session
+        available = s.mic_available if s else False
+        device = s.mic_device_name if s else ""
+        # Main toolbar action
+        self._mic_action.setChecked(not active)
+        if active:
+            self._mic_action.setIcon(icons.icon_mic(theme.ACCENT))
+            self._mic_action.setToolTip(
+                f"Mic: {device} (click to mute)" if device else "Mic: active (click to mute)")
+        else:
+            self._mic_action.setIcon(icons.icon_mic_muted())
+            self._mic_action.setToolTip("Mic: muted (click to unmute)")
+        # Status bar
+        mic_text = f"Mic: {device}" if active and device else ("Mic: muted" if not active else "Mic")
+        self.statusBar().showMessage(mic_text, 3000)
+        # Fullscreen toolbar
+        if hasattr(self, "_fs_toolbar"):
+            self._fs_toolbar.update_mic_state(active, device)
+        # Quality panel
+        self._quality_panel.update_mic_status(available, not active, device)
 
     def _disconnect_active(self):
         """Disconnect the active session and close its tab.
