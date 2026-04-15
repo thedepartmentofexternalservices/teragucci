@@ -20,6 +20,7 @@ import pwd
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -294,6 +295,8 @@ class UserSession:
     # the fd destroys the device) and to hand it to the input injector.
     pen_tablet: Optional["VirtualPenTablet"] = None
     pen_tablet_event: str = ""  # /dev/input/eventN path
+    # WM watchdog — set to True in _cleanup_session() to stop the thread
+    wm_watchdog_stop: bool = False
 
     @property
     def alive(self) -> bool:
@@ -426,6 +429,7 @@ class SessionManager:
 
         # Start PulseAudio for the user (audio capture needs it)
         self._start_pulseaudio(session)
+        self._ensure_audio_sink(session)
 
         # Start window manager (gnome-shell needs D-Bus ready)
         if self._wm_cmd:
@@ -433,6 +437,9 @@ class SessionManager:
                 # Give D-Bus and X server time to fully initialize
                 time.sleep(1)
             self._start_window_manager(session)
+            # Background watchdog restarts the WM if it crashes (e.g. on
+            # fresh boot before logind/D-Bus are fully ready)
+            self._start_wm_watchdog(session)
 
         # Start X compositor so screen capture reads coherent framebuffers
         # (fixes tearing during video playback). gnome-shell is already a
@@ -496,6 +503,17 @@ class SessionManager:
         ]
         if xauthority:
             xorg_cmd.extend(["-auth", xauthority])
+
+        # Clean up stale socket (socket without matching lock file means a
+        # previous Xorg died without cleanup — remove it so Xorg can bind).
+        stale_socket = f"/tmp/.X11-unix/X{display_num}"
+        stale_lock = f"/tmp/.X{display_num}-lock"
+        if os.path.exists(stale_socket) and not os.path.exists(stale_lock):
+            logger.warning("Removing stale X socket %s (no lock file)", stale_socket)
+            try:
+                os.remove(stale_socket)
+            except OSError as e:
+                logger.warning("Could not remove stale socket %s: %s", stale_socket, e)
 
         logger.info("Starting Xorg GPU display %s: %s", display, " ".join(xorg_cmd))
 
@@ -727,6 +745,15 @@ EndSection
         if xauthority:
             xvfb_cmd.extend(["-auth", xauthority])
 
+        stale_socket = f"/tmp/.X11-unix/X{display_num}"
+        stale_lock = f"/tmp/.X{display_num}-lock"
+        if os.path.exists(stale_socket) and not os.path.exists(stale_lock):
+            logger.warning("Removing stale X socket %s (no lock file)", stale_socket)
+            try:
+                os.remove(stale_socket)
+            except OSError as e:
+                logger.warning("Could not remove stale socket %s: %s", stale_socket, e)
+
         logger.info("Starting Xvfb on %s (software rendering)", display)
         xvfb_proc = subprocess.Popen(
             xvfb_cmd,
@@ -874,6 +901,47 @@ EndSection
             logger.info("PulseAudio started for %s", session.username)
         except Exception as e:
             logger.warning("PulseAudio failed for %s: %s", session.username, e)
+
+    def _ensure_audio_sink(self, session: UserSession):
+        """Load a dedicated system-audio null-sink (teraguchi_audio).
+
+        This gives applications a stable output device and provides
+        teraguchi_audio.monitor for AudioCapture — regardless of whether
+        PipeWire/PulseAudio created auto_null or not.
+        """
+        pa_server = f"unix:/run/user/{session.uid}/pulse/native"
+        env = session.env.copy()
+        env["PULSE_RUNTIME_PATH"] = f"/run/user/{session.uid}/pulse"
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{session.uid}"
+        demote = lambda: self._demote(session.uid, session.gid)
+
+        # Wait briefly for PulseAudio/PipeWire socket to be ready
+        for _ in range(10):
+            if os.path.exists(pa_server.replace("unix:", "")):
+                break
+            time.sleep(0.2)
+
+        try:
+            # Check if already loaded (idempotent)
+            result = subprocess.run(
+                ["pactl", "--server", pa_server, "list", "short", "modules"],
+                capture_output=True, text=True, timeout=5,
+                env=env, preexec_fn=demote)
+            if "teraguchi_audio" in result.stdout:
+                logger.debug("teraguchi_audio sink already present for %s", session.username)
+                return
+
+            subprocess.run(
+                ["pactl", "--server", pa_server,
+                 "load-module", "module-null-sink",
+                 "sink_name=teraguchi_audio",
+                 "sink_properties=device.description=Teraguchi_Audio"],
+                capture_output=True, timeout=5,
+                env=env, preexec_fn=demote)
+            logger.info("Loaded teraguchi_audio null-sink for %s", session.username)
+        except Exception as e:
+            logger.warning("Could not load teraguchi_audio sink for %s: %s",
+                           session.username, e)
 
     def _get_logind_session_id(self, username: str) -> str:
         """Find an existing logind session ID for the user.
@@ -1041,6 +1109,57 @@ EndSection
         except Exception as e:
             logger.warning("Could not enable linger for %s: %s", username, e)
         return False
+
+    def _start_wm_watchdog(self, session: UserSession):
+        """Start a background thread that restarts the WM if it crashes.
+
+        This handles the common failure mode on headless machines after a
+        fresh boot: gnome-shell starts before D-Bus / logind are fully
+        initialised, crashes within the first few seconds, and then stays
+        dead as a zombie because no user has connected yet (so
+        get_session() is never called).
+
+        Backoff schedule: 3 s, 6 s, 12 s, 24 s, 48 s, capped at 60 s.
+        The thread exits when Xorg dies (session truly gone) or when
+        session.wm_watchdog_stop is set (cleanup_session called).
+        """
+        session.wm_watchdog_stop = False
+
+        def _watchdog():
+            backoff = 3.0
+            while not session.wm_watchdog_stop:
+                # Exit immediately if Xorg itself is gone
+                if session.xorg_proc and session.xorg_proc.poll() is not None:
+                    logger.debug("WM watchdog: Xorg gone for %s — exiting",
+                                 session.username)
+                    return
+
+                proc = session.wm_proc
+                if proc is not None and proc.poll() is not None:
+                    rc = proc.returncode
+                    if session.wm_watchdog_stop:
+                        return
+                    logger.warning(
+                        "WM watchdog: WM exited (rc=%s) for %s — "
+                        "restarting in %.0fs",
+                        rc, session.username, backoff)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                    if session.wm_watchdog_stop:
+                        return
+                    self._start_window_manager(session)
+                    # Reset backoff after a successful long-running restart
+                    # (detected on next iteration)
+                else:
+                    # WM is running — reset backoff and wait
+                    backoff = 3.0
+                    time.sleep(5.0)
+
+        t = threading.Thread(target=_watchdog,
+                             name=f"wm-watchdog-{session.username}",
+                             daemon=True)
+        t.start()
+        logger.debug("WM watchdog started for %s", session.username)
 
     def _start_window_manager(self, session: UserSession):
         try:
@@ -1239,6 +1358,10 @@ EndSection
             logger.info("Session destroyed: %s", username)
 
     def _cleanup_session(self, session: UserSession):
+        # Signal the WM watchdog thread to stop before killing processes,
+        # so it doesn't race to restart gnome-shell while we're tearing down.
+        session.wm_watchdog_stop = True
+
         # Close the pen tablet first so the uinput device is destroyed
         # before Xorg shuts down (avoids stale input device errors in log).
         if session.pen_tablet:

@@ -59,6 +59,14 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - PCM streaming with configurable bitrate (32-320 kbps)
 - Toggle on/off from quality settings
 
+### Microphone
+- Client microphone streamed to the server in real time (client → server)
+- Captured via `QAudioSource` — PCM s16le, 48 kHz mono, 20 ms chunks
+- Server pipeline: `pacat` → `module-null-sink` (`teraguchi_mic_sink`) → `module-virtual-source` (`teraguchi_mic`)
+- **`teraguchi_mic` appears as a real input device** in GNOME Sound Settings, Zoom, OBS, etc. — not as a monitor source
+- Starts automatically on connect, mute/unmute from quality panel or toolbar
+- Tested on PipeWire 0.3.48 (Ubuntu 22.04)
+
 ### Sessions
 - **PAM mode** — per-user Xvfb/Xorg sessions with GNOME, isolated displays
 - **Legacy mode** — single shared display (existing X session)
@@ -70,6 +78,11 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - Bookmark system with encrypted credential storage
 - Import/Export bookmarks as JSON
 - Auto-reconnect with exponential backoff
+- Bookmark panel shows a live **connection status dot** per entry (green = connected, gray = idle)
+- **Disconnect from bookmark panel** — double-click or right-click an active bookmark to disconnect without navigating tabs
+- **Bookmark panel is hidden by default** — press **B** or use View → Bookmarks to toggle; state persists across restarts
+- **Branded disconnect overlay** — when a session disconnects or is connecting, the viewer shows a branded "teraguchi" overlay with status and hostname instead of freezing the last video frame
+- **Power management** — each bookmark can configure a power backend (SSH, Wake-on-LAN, teraguchi in-band); a power icon appears per row and right-click exposes Power On / Power Off / Reboot (see [Power Management](#power-management))
 
 ### Health Monitoring
 - Real-time overlay (F9) — RTT, FPS, bandwidth, dropped frames, encode/capture timing
@@ -85,38 +98,42 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 ## Architecture
 
 ```
-┌─────────────────────────┐     WebSocket (wss://)     ┌─────────────────────────┐
-│   Client (macOS/Win)    │  ─ JSON control/input ──►   │   Server (Linux)        │
-│                         │  ◄─ Binary video/audio ──   │                         │
-│  PySide6 GUI            │  ◄─ JSON health/clipboard   │  Screen Capture         │
-│  ├─ RemoteViewer        │  ◄─ JSON cursor shapes ──   │  ├─ NvFBC helper (NV)   │
-│  ├─ QTabletEvent (pen)  │                             │  ├─ mss / XShm          │
-│  ├─ Tabbed sessions     │  ─ USB/IP (sideband) ──►   │  └─ Multi-monitor       │
-│  ├─ Bookmark panel      │                             │                         │
-│  ├─ Quality controls    │                             │  Cursor Tracker         │
-│  ├─ USB device panel    │                             │  └─ XFixes shape poll   │
-│  ├─ Health overlay      │                             │                         │
-│  ├─ Local cursor render │                             │  Video Encoder (FFmpeg)  │
-│  ├─ File drag-and-drop  │                             │  ├─ h264_nvenc          │
-│  └─ Audio playback      │                             │  ├─ hevc_nvenc          │
-│                         │                             │  ├─ libx264 / libx265   │
-│                         │                             │  └─ YUV 4:4:4 profiles  │
-│                         │                             │                         │
-│  Decoders (PyAV)        │                             │  Input Injection         │
-│  ├─ H.264 / H.265      │                             │  ├─ XTest (Xvfb)        │
-│  ├─ AV1                 │                             │  ├─ uinput (physical)   │
-│  └─ HW accel (CUDA,     │                             │  └─ Wacom tablet device │
-│     VideoToolbox, VAAPI) │                             │                         │
-│                         │                             │  Session Manager (PAM)   │
-│                         │                             │  ├─ Per-user Xvfb/Xorg  │
-│                         │                             │  ├─ GNOME shell          │
-│                         │                             │  └─ PulseAudio per-user  │
-│                         │                             │                         │
-│                         │                             │  USB/IP (vhci-hcd)      │
-│                         │                             │  Clipboard (xclip)      │
-│                         │                             │  File Receiver          │
-│                         │                             │  Auth (PAM / local)     │
-└─────────────────────────┘                             └─────────────────────────┘
+┌─────────────────────────┐         WebSocket (wss://)        ┌─────────────────────────┐
+│   Client (macOS/Win)    │  ─ JSON control/input ──────────►  │   Server (Linux)        │
+│                         │  ─ Binary mic audio (MIC 0x11) ►  │                         │
+│  PySide6 GUI            │  ◄─ Binary video (H264/H265/AV1)  │  Screen Capture         │
+│  ├─ RemoteViewer        │  ◄─ Binary audio (AUDIO 0x10) ─   │  ├─ NvFBC helper (NV)   │
+│  ├─ QTabletEvent (pen)  │  ◄─ JSON health/clipboard ──────  │  ├─ mss / XShm          │
+│  ├─ Tabbed sessions     │  ◄─ JSON cursor shapes ─────────  │  └─ Multi-monitor       │
+│  ├─ Bookmark panel      │                                    │                         │
+│  │  └─ status dots      │  ─ USB/IP (sideband) ──────────►  │  Cursor Tracker         │
+│  ├─ Quality controls    │                                    │  └─ XFixes shape poll   │
+│  ├─ USB device panel    │                                    │                         │
+│  ├─ Health overlay      │                                    │  Video Encoder (FFmpeg)  │
+│  ├─ Local cursor render │                                    │  ├─ h264_nvenc          │
+│  ├─ File drag-and-drop  │                                    │  ├─ hevc_nvenc          │
+│  ├─ Audio playback      │                                    │  ├─ libx264 / libx265   │
+│  └─ Mic capture         │                                    │  └─ YUV 4:4:4 profiles  │
+│                         │                                    │                         │
+│  Decoders (PyAV)        │                                    │  Mic Injector           │
+│  ├─ H.264 / H.265      │                                    │  └─ PA null-sink +      │
+│  ├─ AV1                 │                                    │     pacat injection     │
+│  └─ HW accel:           │                                    │                         │
+│     macOS → VideoToolbox│                                    │  Input Injection         │
+│     Linux → CUDA / VAAPI│                                    │  ├─ XTest (Xvfb)        │
+│     Win   → D3D11VA     │                                    │  ├─ uinput (physical)   │
+│                         │                                    │  └─ Wacom tablet device │
+│                         │                                    │                         │
+│                         │                                    │  Session Manager (PAM)   │
+│                         │                                    │  ├─ Per-user Xvfb/Xorg  │
+│                         │                                    │  ├─ GNOME shell          │
+│                         │                                    │  └─ PulseAudio per-user  │
+│                         │                                    │                         │
+│                         │                                    │  USB/IP (vhci-hcd)      │
+│                         │                                    │  Clipboard (xclip)      │
+│                         │                                    │  File Receiver          │
+│                         │                                    │  Auth (PAM / local)     │
+└─────────────────────────┘                                    └─────────────────────────┘
 ```
 
 ## Installation
@@ -266,6 +283,102 @@ The quality bias slider maps to encoder parameters:
 - Files are checksummed (SHA-256) and transferred in 256 KB chunks
 - Destination: `~/Desktop` on the remote machine
 
+### Microphone
+
+The client microphone is streamed to the server automatically when a session connects. No configuration is required.
+
+On the **server**, a PulseAudio virtual sink named `teraguchi_mic` is created. Applications can select it as their input source:
+
+- **Unreal Engine 5** — Settings → Audio → Input Device → `Teraguchi Microphone`
+- **OBS / Discord / Zoom** — select `Monitor of Teraguchi Microphone` in audio input settings
+- **Command line:** `pactl set-default-source teraguchi_mic.monitor`
+
+The virtual sink persists only while a client is connected; it is removed on disconnect.
+
+> **Requirement:** PulseAudio must be running in the user's session on the server. If no mic audio appears, check `pactl info` on the server to verify the PulseAudio daemon is active.
+
+### Power Management
+
+Each bookmark can optionally configure a **power backend** to control the remote machine directly from the bookmark panel — without needing an active session.
+
+**UI:** When a bookmark has power management configured, a small power icon appears on the right side of its row. Left-clicking the icon or right-clicking the bookmark → **Power** opens a menu with **Power On**, **Power Off**, and **Reboot**. Power Off and Reboot require confirmation. To configure power settings, right-click → **Power Settings...**.
+
+#### Supported backends
+
+| Backend | Power On | Power Off / Reboot | Notes |
+|---|---|---|---|
+| `ssh` | WoL (if MAC configured) | SSH `systemctl poweroff/reboot` | Works for Linux and Windows |
+| `teraguchi` | WoL (if MAC configured) | In-band via live session; falls back to SSH | Best option when teraguchi server is running |
+| `wol` | Wake-on-LAN | — | Power-on only; no off/reboot |
+| `none` / empty | — | — | Power buttons hidden in UI |
+
+#### Bookmark fields
+
+Power settings are stored as flat fields inside the bookmark JSON (`~/.config/teraguchi/bookmarks.json` on Linux, `~/Library/Application Support/Teraguchi/bookmarks.json` on macOS). They can also be set via **right-click → Power Settings...** in the UI.
+
+| Field | Default | Description |
+|---|---|---|
+| `power_backend` | `""` | `"ssh"`, `"teraguchi"`, `"wol"`, `"none"`, or `""` (disabled) |
+| `power_os` | `"linux"` | `"linux"` or `"windows"` — controls which shutdown command is sent |
+| `power_ssh_host` | `""` | SSH host override; empty = use the bookmark's host |
+| `power_ssh_user` | `""` | SSH user; empty = use the bookmark's username |
+| `power_ssh_key` | `""` | Path to SSH private key; empty = SSH agent or password |
+| `power_wol_mac` | `""` | MAC address for Wake-on-LAN, e.g. `"aa:bb:cc:dd:ee:ff"` |
+| `power_wol_broadcast` | `"255.255.255.255"` | WoL broadcast address (change for a specific subnet) |
+
+#### Examples
+
+Linux workstation — SSH off/reboot + WoL power-on:
+
+```json
+{
+  "power_backend": "ssh",
+  "power_os": "linux",
+  "power_ssh_user": "mihai",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "aa:bb:cc:dd:ee:ff"
+}
+```
+
+Windows workstation — SSH off/reboot via OpenSSH + WoL:
+
+```json
+{
+  "power_backend": "ssh",
+  "power_os": "windows",
+  "power_ssh_host": "192.168.1.50",
+  "power_ssh_user": "Administrator",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "bb:cc:dd:ee:ff:00"
+}
+```
+
+teraguchi server running — in-band shutdown with SSH fallback + WoL:
+
+```json
+{
+  "power_backend": "teraguchi",
+  "power_os": "linux",
+  "power_ssh_user": "mihai",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "aa:bb:cc:dd:ee:ff"
+}
+```
+
+#### Fallback logic
+
+```
+Power On:  → send WoL magic packet to power_wol_mac
+Power Off: 1. backend is "teraguchi" AND session is connected → POWER_ACTION over WebSocket
+           2. SSH to power_ssh_host (or bookmark host) → sudo systemctl poweroff / Stop-Computer
+           3. No SSH host configured → show error
+Reboot:    same as Power Off but with reboot command
+```
+
+> **Server requirement for teraguchi in-band:** the server runs the systemctl command directly, so the `teraguchi` system user (or the session user) needs passwordless sudo for `systemctl poweroff` and `systemctl reboot`.
+
+> **Windows SSH commands:** `Stop-Computer -Force` (off) and `Restart-Computer -Force` (reboot) via PowerShell over OpenSSH. Requires OpenSSH server to be installed and running on the Windows machine.
+
 ### USB Device Forwarding
 
 1. Open the **USB Devices** panel (toolbar icon or View menu)
@@ -303,7 +416,8 @@ teraguchi/
 │   ├── protocol.py          # WebSocket client, message routing
 │   ├── viewer.py            # Remote desktop widget, input capture, drag-and-drop
 │   ├── video_decoder.py     # H.264/H.265/AV1 decode via PyAV
-│   ├── audio_player.py      # Audio playback via QAudioSink
+│   ├── audio_player.py      # Audio playback via QAudioSink (server → client)
+│   ├── mic_capture.py       # Microphone capture via QAudioSource (client → server)
 │   ├── file_transfer.py     # Chunked file sender
 │   ├── usb_forward.py       # USB device enumeration and forwarding
 │   ├── bookmarks.py         # Bookmark storage with encrypted credentials
@@ -322,7 +436,8 @@ teraguchi/
 │   ├── video_encoder.py     # FFmpeg H.264/H.265/AV1 encoder with HW accel
 │   ├── input_injector.py    # uinput mouse/keyboard/pen injection
 │   ├── xtest_injector.py    # XTest injection for Xvfb virtual displays
-│   ├── audio_capture.py     # PulseAudio/PipeWire audio capture
+│   ├── audio_capture.py     # PulseAudio/PipeWire audio capture (server → client)
+│   ├── mic_injector.py      # PulseAudio virtual mic injection (client → server)
 │   ├── clipboard.py         # Clipboard sync via xclip
 │   ├── file_transfer.py     # Chunked file receiver with checksum verification
 │   ├── usb_passthrough.py   # USB/IP device attach/detach
@@ -361,9 +476,14 @@ Teraguchi uses a hybrid WebSocket protocol:
 [1B frame_type] [1B codec] [1B chroma] [1B flags] [4B timestamp_ms] [2B monitor_id] [payload]
 ```
 
-**Audio:**
+**Audio (server → client):**
 ```
 [1B frame_type=0x10] [1B codec] [2B reserved] [4B timestamp_ms] [payload]
+```
+
+**Microphone (client → server):**
+```
+[1B frame_type=0x11] [1B codec] [2B reserved] [4B timestamp_ms] [payload: PCM s16le]
 ```
 
 ### Message Types
@@ -398,7 +518,8 @@ Teraguchi uses a hybrid WebSocket protocol:
 | Per-User Sessions | **Yes (PAM)** | Yes | No | Yes |
 | Multi-Monitor | **Yes** | Yes | Yes | Yes |
 | Clipboard Sync | **Yes** | Yes | Yes | Yes |
-| Audio | **Yes** | Yes | Yes | Yes |
+| Audio playback | **Yes** | Yes | Yes | Yes |
+| Microphone streaming | **Yes** | Yes | No | No |
 | TLS | **Yes** | Yes | Built-in | No |
 | Auto-Reconnect | **Yes** | Yes | Yes | No |
 | Linux Server | **Yes** | Yes | Yes | Yes |

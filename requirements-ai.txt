@@ -1,0 +1,15 @@
+# Teraguchi AI Client dependencies
+# Install with: uv pip install -r requirements-ai.txt
+
+# WebSocket transport (same as client)
+websockets>=12.0
+
+# Video frame decoding
+av>=12.0
+
+# Image handling
+numpy>=1.24
+Pillow>=10.0
+
+# MCP server framework
+fastmcp>=2.0

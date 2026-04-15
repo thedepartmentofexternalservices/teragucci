@@ -18,13 +18,14 @@ from PySide6.QtWidgets import QApplication
 from client.viewer import RemoteViewer
 from client.protocol import ClientProtocol
 from client.audio_player import AudioPlayer
+from client.mic_capture import MicCapture
 from client.video_decoder import DecoderManager
 from client.health_display import HealthOverlay, HealthData
 from client.file_transfer import FileSender
 from client.usb_forward import USBForwardClient
 from common.messages import (
     MsgType, FrameType, QualitySettings, VideoCodec,
-    HealthPong, parse_message,
+    HealthPong, parse_message, encode_mic_header, AudioCodec,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class Session(QObject):
     file_transfer_finished = Signal(str, bool, str)  # transfer_id, success, message
     usb_devices_updated = Signal(dict)  # server response with device list + attached
     broker_machine_needed = Signal(list)  # broker wants user to pick a machine
+    mic_state_changed = Signal(bool)    # True = active, False = muted/unavailable
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,8 +89,11 @@ class Session(QObject):
         self.decoder = DecoderManager()
         self.health = HealthData()
         self.audio = AudioPlayer()
+        self.mic = MicCapture()
         self.file_sender = FileSender()
         self.usb_client = USBForwardClient()
+
+        self._mic_muted = False
 
         # Bridge for thread safety
         self._bridge = _Bridge()
@@ -176,6 +181,47 @@ class Session(QObject):
         if self.usb_client:
             self.usb_client.cleanup()
 
+    # ── Mic controls ─────────────────────────────
+
+    @property
+    def mic_available(self) -> bool:
+        return self.mic.available
+
+    @property
+    def mic_muted(self) -> bool:
+        return self._mic_muted
+
+    @property
+    def mic_device_name(self) -> str:
+        """Human-readable name of the mic device in use, or empty string."""
+        if not self.mic.available:
+            return ""
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            dev = QMediaDevices.defaultAudioInput()
+            return dev.description() if not dev.isNull() else ""
+        except Exception:
+            return ""
+
+    def toggle_mic(self):
+        """Mute or unmute the microphone. Emits mic_state_changed."""
+        if not self.mic.available:
+            return
+        if self._mic_muted:
+            # Unmute: restart capture
+            self.mic.on_mic_frame = self._on_mic_frame
+            self.mic.start()
+            self._mic_muted = False
+        else:
+            # Mute: stop sending frames to server
+            self.mic.stop()
+            self._mic_muted = True
+        self.mic_state_changed.emit(not self._mic_muted)
+
+    def set_mic_muted(self, muted: bool):
+        if muted != self._mic_muted:
+            self.toggle_mic()
+
     # ── Quality / Controls ───────────────────────
 
     def apply_quality(self, settings: QualitySettings):
@@ -214,8 +260,8 @@ class Session(QObject):
 
         p.on_server_hello = b.server_hello.emit
         p.on_jpeg_frame = lambda ft, x, y, w, h, d: b.jpeg_frame.emit(ft, x, y, w, h, d)
-        p.on_video_frame = lambda ft, c, ch, f, t, m, d: b.video_frame.emit(ft, c, ch, f, t, m, d)
-        p.on_audio_frame = lambda c, t, d: b.audio_frame.emit(c, t, d)
+        p.on_video_frame = lambda ft, c, ch, f, t, m, d: b.video_frame.emit(ft, c, ch, f, t & 0x7FFFFFFF, m, d)
+        p.on_audio_frame = lambda c, t, d: b.audio_frame.emit(c, t & 0x7FFFFFFF, d)
         p.on_connected = b.connected.emit
         p.on_disconnected = b.disconnected.emit
         p.on_error = b.error.emit
@@ -333,6 +379,12 @@ class Session(QObject):
         if self.audio and self.audio.available:
             self.audio.feed(codec, ts, data)
 
+    def _on_mic_frame(self, pcm_data: bytes):
+        """Send a raw PCM mic chunk to the server as a binary MIC frame."""
+        ts = int(time.time() * 1000) & 0xFFFFFFFF  # mask to uint32 for struct pack
+        header = encode_mic_header(AudioCodec.PCM, ts)
+        self.protocol.send_binary(header + pcm_data)
+
     def _on_connected(self):
         self.status_changed.emit("connected")
         # Start monitoring local clipboard for client→server sync
@@ -340,6 +392,11 @@ class Session(QObject):
         clipboard.dataChanged.connect(self._on_clipboard_local_changed)
         # Advertise USB devices to server
         self._send_usb_device_list()
+        # Start mic (unless user had muted it in a previous session)
+        if self.mic.available and not self._mic_muted:
+            self.mic.on_mic_frame = self._on_mic_frame
+            self.mic.start()
+        self.mic_state_changed.emit(self.mic.available and not self._mic_muted)
 
     def _on_disconnected(self, reason):
         self.status_changed.emit("disconnected")
@@ -454,3 +511,16 @@ class Session(QObject):
     def usb_refresh(self):
         """Re-enumerate and send device list."""
         self._send_usb_device_list()
+
+    def send_power_action(self, action: str):
+        """Ask the server to execute a power action on the remote machine.
+
+        action: "power_off" | "reboot"
+
+        The server must have appropriate sudo privileges to execute the
+        underlying systemctl command.
+        """
+        from common.messages import MsgType
+        if not self.is_connected:
+            raise RuntimeError("Not connected")
+        self.protocol.send_input({"type": MsgType.POWER_ACTION, "action": action})

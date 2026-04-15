@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QSize
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QMouseEvent, QKeyEvent,
     QTabletEvent, QWheelEvent, QResizeEvent, QCursor,
+    QColor, QFont, QFontMetricsF,
 )
 from PySide6.QtWidgets import QWidget
 
@@ -84,6 +85,11 @@ class RemoteViewer(QWidget):
         # Accept file drag-and-drop
         self.setAcceptDrops(True)
 
+        # Connection overlay state — controls what paintEvent draws when not streaming
+        # Values: "idle", "connecting", "connected", "disconnected", "error"
+        self._conn_state: str = "idle"
+        self._conn_message: str = ""
+
         # Cursor state. We render Flame's real cursor LOCALLY using
         # shape updates shipped out-of-band from the server (via
         # XFixesGetCursorImage on the Linux side). That gives us
@@ -121,6 +127,23 @@ class RemoteViewer(QWidget):
             self._composite_h = 0
         self._pixmap = None
         self._update_scaling()
+        self.update()
+
+    def set_connection_state(self, state: str, message: str = ""):
+        """Update the connection overlay shown when not actively streaming.
+
+        Args:
+            state:   "idle" | "connecting" | "connected" | "disconnected" | "error"
+            message: Optional detail line (hostname, error reason, etc.)
+        """
+        self._conn_state = state
+        self._conn_message = message
+        if state != "connected":
+            # Drop the last video frame so the frozen image is never visible
+            self._screen_image = None
+            self._pixmap = None
+            # Reset cursor to arrow — remote cursor is gone
+            self.setCursor(Qt.ArrowCursor)
         self.update()
 
     def set_remote_cursor(self, serial: int, width: int, height: int,
@@ -258,11 +281,83 @@ class RemoteViewer(QWidget):
 
     # --- Paint ---
 
+    def _draw_connection_overlay(self, painter: QPainter):
+        """Draw the branded idle/connecting/disconnected/error screen."""
+        r = self.rect()
+        cx = r.width() / 2
+        cy = r.height() / 2
+
+        # Wordmark — "teraguchi" in gold
+        wordmark_font = QFont("SF Pro Display, Helvetica Neue, Arial", -1)
+        wordmark_font.setPixelSize(max(28, min(72, r.height() // 12)))
+        wordmark_font.setWeight(QFont.Weight.Light)
+        wordmark_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 6)
+        painter.setFont(wordmark_font)
+        painter.setPen(QColor("#d4a855"))  # GOLD
+        fm = QFontMetricsF(wordmark_font)
+        wm_text = "teraguchi"
+        wm_w = fm.horizontalAdvance(wm_text)
+        wm_h = fm.height()
+        painter.drawText(QRectF(cx - wm_w / 2, cy - wm_h * 0.8, wm_w + 2, wm_h * 1.4),
+                         Qt.AlignCenter, wm_text)
+
+        # Status line
+        state_colors = {
+            "idle":         "#4e4e6a",   # TEXT_MUTED
+            "connecting":   "#f5a623",   # WARNING
+            "disconnected": "#8b8ba3",   # TEXT_SECONDARY
+            "error":        "#e5484d",   # DANGER
+        }
+        status_labels = {
+            "idle":         "No active connection",
+            "connecting":   "Connecting...",
+            "disconnected": "Disconnected",
+            "error":        "Connection error",
+        }
+        status_text = status_labels.get(self._conn_state, self._conn_state)
+        status_color = state_colors.get(self._conn_state, "#8b8ba3")
+
+        status_font = QFont("SF Pro Display, Helvetica Neue, Arial", -1)
+        status_font.setPixelSize(max(11, min(16, r.height() // 40)))
+        status_font.setWeight(QFont.Weight.Normal)
+        status_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1)
+        painter.setFont(status_font)
+        painter.setPen(QColor(status_color))
+        sfm = QFontMetricsF(status_font)
+        st_w = sfm.horizontalAdvance(status_text)
+        st_h = sfm.height()
+        painter.drawText(
+            QRectF(cx - st_w / 2, cy + wm_h * 0.8, st_w + 2, st_h * 1.6),
+            Qt.AlignCenter, status_text)
+
+        # Detail message (hostname, error reason) — one line below status
+        if self._conn_message:
+            msg_font = QFont("SF Mono, JetBrains Mono, Menlo, monospace", -1)
+            msg_font.setPixelSize(max(10, min(13, r.height() // 50)))
+            painter.setFont(msg_font)
+            painter.setPen(QColor("#4e4e6a"))  # TEXT_MUTED
+            mfm = QFontMetricsF(msg_font)
+            msg_w = mfm.horizontalAdvance(self._conn_message)
+            msg_y = cy + wm_h * 0.8 + st_h * 1.8
+            painter.drawText(
+                QRectF(cx - msg_w / 2, msg_y, msg_w + 2, mfm.height() * 1.4),
+                Qt.AlignCenter, self._conn_message)
+
+        # Subtle accent rule above wordmark
+        accent = QColor("#00c878")  # ACCENT
+        accent.setAlphaF(0.25)
+        painter.setPen(accent)
+        rule_w = min(120, r.width() // 4)
+        rule_y = cy - wm_h * 1.4
+        painter.drawLine(QRectF(cx - rule_w / 2, rule_y, rule_w, 0).toRect().topLeft(),
+                         QRectF(cx + rule_w / 2, rule_y, rule_w, 0).toRect().topLeft())
+
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.black)
+        painter.fillRect(self.rect(), QColor("#0a0a10"))  # BG_PRIMARY
 
         if self._screen_image is None:
+            self._draw_connection_overlay(painter)
             painter.end()
             return
 

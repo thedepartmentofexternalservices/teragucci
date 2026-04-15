@@ -185,3 +185,38 @@ def icon_usb(color="#8b8ba3"):
         '<path d="M9.26 7.68 5 12l2 2"/>'
         '<path d="m10 14 5 5"/>'
         '<circle cx="16" cy="20" r="1"/>', color)
+
+
+def icon_mic(color="#8b8ba3"):
+    """Microphone — active (sending)."""
+    return _svg_icon(
+        '<rect x="9" y="2" width="6" height="11" rx="3"/>'
+        '<path d="M19 10a7 7 0 0 1-14 0"/>'
+        '<line x1="12" y1="19" x2="12" y2="22"/>'
+        '<line x1="8" y1="22" x2="16" y2="22"/>', color)
+
+
+def icon_mic_muted(color="#8b8ba3"):
+    """Microphone with slash — muted."""
+    return _svg_icon(
+        '<rect x="9" y="2" width="6" height="11" rx="3"/>'
+        '<path d="M19 10a7 7 0 0 1-14 0"/>'
+        '<line x1="12" y1="19" x2="12" y2="22"/>'
+        '<line x1="8" y1="22" x2="16" y2="22"/>'
+        '<line x1="2" y1="2" x2="22" y2="22" stroke-width="2"/>', color)
+
+
+def icon_speaker(color="#8b8ba3"):
+    """Speaker / audio output — remote audio active."""
+    return _svg_icon(
+        '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>'
+        '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>'
+        '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>', color)
+
+
+def icon_speaker_muted(color="#8b8ba3"):
+    """Speaker with slash — remote audio muted/off."""
+    return _svg_icon(
+        '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>'
+        '<line x1="23" y1="9" x2="17" y2="15"/>'
+        '<line x1="17" y1="9" x2="23" y2="15"/>', color)

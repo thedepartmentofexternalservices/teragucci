@@ -9,6 +9,7 @@ Falls back gracefully if hardware decode is unavailable.
 """
 
 import logging
+import sys
 import time
 from typing import Optional, Callable, List
 
@@ -22,34 +23,38 @@ except ImportError:
     logger.warning("PyAV not installed — video decode disabled. Install with: pip install av")
 
 
-# Hardware decoder configs per platform
-HW_DECODERS = {
-    "h264": [
-        # (codec_name, hw_type) — tried in order
-        ("h264", "cuda"),         # NVIDIA
-        ("h264", "vaapi"),        # Intel/AMD Linux
-        ("h264", "dxva2"),        # Windows
-        ("h264", "d3d11va"),      # Windows
-        ("h264", "videotoolbox"), # macOS
-        ("h264", None),           # Software fallback
-    ],
-    "h265": [
-        ("hevc", "cuda"),
-        ("hevc", "vaapi"),
-        ("hevc", "dxva2"),
-        ("hevc", "d3d11va"),
-        ("hevc", "videotoolbox"),
-        ("hevc", None),
-    ],
-    "av1": [
-        ("av1", "cuda"),
-        ("av1", "vaapi"),
-        ("av1", "dxva2"),
-        ("av1", "d3d11va"),
-        ("av1", "videotoolbox"),
-        ("av1", None),
-    ],
-}
+def _build_hw_decoders() -> dict:
+    """
+    Build platform-aware hardware decoder priority lists.
+
+    CUDA is deliberately skipped on macOS: ctx.open() succeeds (generic codec
+    context) but actual CUDA GPU operations segfault at runtime because macOS
+    has no NVIDIA CUDA runtime. VideoToolbox is the correct native accelerator.
+    """
+    is_mac = sys.platform == "darwin"
+    is_win = sys.platform == "win32"
+
+    if is_mac:
+        return {
+            "h264": [("h264", "videotoolbox"), ("h264", None)],
+            "h265": [("hevc", "videotoolbox"), ("hevc", None)],
+            "av1":  [("av1",  "videotoolbox"), ("av1",  None)],
+        }
+    if is_win:
+        return {
+            "h264": [("h264", "d3d11va"), ("h264", "dxva2"), ("h264", "cuda"), ("h264", None)],
+            "h265": [("hevc", "d3d11va"), ("hevc", "dxva2"), ("hevc", "cuda"), ("hevc", None)],
+            "av1":  [("av1",  "d3d11va"), ("av1",  "dxva2"), ("av1",  "cuda"), ("av1",  None)],
+        }
+    # Linux: NVIDIA first, then VAAPI (Intel/AMD), then software
+    return {
+        "h264": [("h264", "cuda"), ("h264", "vaapi"), ("h264", None)],
+        "h265": [("hevc", "cuda"), ("hevc", "vaapi"), ("hevc", None)],
+        "av1":  [("av1",  "cuda"), ("av1",  "vaapi"), ("av1",  None)],
+    }
+
+
+HW_DECODERS = _build_hw_decoders()
 
 
 class VideoDecoder:

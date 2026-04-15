@@ -29,7 +29,7 @@ sys.path.insert(0, ".")
 from client import theme
 from client import icons
 from client.session import Session
-from client.bookmarks import BookmarkManager
+from client.bookmarks import BookmarkManager, UISettings
 from client.health_display import HealthStatusWidget, HealthData
 from client.quality_control import QualityControlPanel
 from client.fullscreen_toolbar import FullscreenToolbar, REVEAL_ZONE
@@ -257,6 +257,15 @@ class BrokerMachinePicker(QDialog):
 class BookmarkDelegate(QStyledItemDelegate):
     """Custom delegate for bookmark items — card-style with server icon."""
 
+    # Left icon hit-area width (from card left edge): 8px margin + 20px icon + 8px buffer
+    ICON_ZONE_WIDTH = 36
+
+    def __init__(self, parent=None, active_ids=None, power_ids=None):
+        super().__init__(parent)
+        self._active_ids = active_ids if active_ids is not None else set()
+        # Set of bookmark IDs that have power management configured
+        self._power_ids: set = power_ids if power_ids is not None else set()
+
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), 56)
 
@@ -277,10 +286,33 @@ class BookmarkDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.NoBrush)
             painter.setPen(Qt.NoPen)
 
-        # Server icon
-        icon = icons.icon_server(theme.TEXT_SECONDARY)
-        icon_rect = rect.adjusted(8, 10, 0, 0)
-        icon.paint(painter, icon_rect.x(), icon_rect.y(), 20, 20)
+        bid   = index.data(Qt.UserRole)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        has_power = bid in self._power_ids
+
+        # Left icon: server icon normally; on hover morph into ⏻ power character
+        ix = rect.x() + 8
+        iy = rect.center().y() - 10
+        if hover:
+            pwr_font = QFont()
+            pwr_font.setPointSize(13)
+            painter.setFont(pwr_font)
+            if has_power:
+                painter.setPen(QColor(theme.WARNING))
+            else:
+                painter.setOpacity(0.35)
+                painter.setPen(QColor(theme.TEXT_MUTED))
+            painter.drawText(ix, iy, 20, 20, Qt.AlignCenter, "\u23fb")
+            painter.setOpacity(1.0)
+        else:
+            icons.icon_server(theme.TEXT_SECONDARY).paint(painter, ix, iy, 20, 20)
+            if has_power:
+                # Small ⏻ badge on bottom-right of server icon
+                badge_font = QFont()
+                badge_font.setPointSize(7)
+                painter.setFont(badge_font)
+                painter.setPen(QColor(theme.WARNING))
+                painter.drawText(ix + 10, iy + 10, 12, 12, Qt.AlignCenter, "\u23fb")
 
         # Name (bold)
         name = index.data(Qt.UserRole + 1) or "Unnamed"
@@ -289,7 +321,7 @@ class BookmarkDelegate(QStyledItemDelegate):
         name_font.setWeight(QFont.DemiBold)
         name_font.setPointSize(12)
         painter.setFont(name_font)
-        painter.drawText(rect.adjusted(36, 6, -8, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
+        painter.drawText(rect.adjusted(36, 6, -20, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
 
         # Host:port (secondary)
         host_text = index.data(Qt.UserRole + 2) or ""
@@ -297,17 +329,145 @@ class BookmarkDelegate(QStyledItemDelegate):
         sub_font = QFont()
         sub_font.setPointSize(10)
         painter.setFont(sub_font)
-        painter.drawText(rect.adjusted(36, 24, -8, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
+        painter.drawText(rect.adjusted(36, 24, -20, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
+
+        # Connection status dot (right side only)
+        is_active = bid in self._active_ids
+        dot_color = QColor(theme.SUCCESS) if is_active else QColor(theme.TEXT_MUTED)
+        dot_color.setAlpha(200 if is_active else 80)
+        painter.setBrush(dot_color)
+        painter.setPen(Qt.NoPen)
+        dot_size = 8
+        dot_x = rect.right() - dot_size - 8
+        dot_y = rect.center().y() - dot_size // 2
+        painter.drawEllipse(dot_x, dot_y, dot_size, dot_size)
 
         painter.restore()
 
 
+class PowerSettingsDialog(QDialog):
+    """Edit power management settings for one bookmark.
+
+    Credentials (host, username) are inherited from the bookmark's connection
+    profile and are not editable here — they are shown read-only as a preview.
+    The only SSH-specific override is the private key path (optional).
+    """
+
+    def __init__(self, parent=None, profile=None):
+        super().__init__(parent)
+        self.setWindowTitle("Power Settings")
+        self.setMinimumWidth(440)
+
+        layout = QFormLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setLabelAlignment(Qt.AlignRight)
+
+        p = profile
+        conn_host = getattr(p, "host", "") or "?"
+        conn_user = getattr(p, "username", "") or "?"
+
+        # Backend
+        self.backend = QComboBox()
+        self.backend.addItem("Disabled", "")
+        self.backend.addItem("teraguchi  (in-band; no extra config)", "teraguchi")
+        self.backend.addItem("SSH  (off/reboot via SSH)", "ssh")
+        self.backend.addItem("WoL only  (power-on only)", "wol")
+        cur = getattr(p, "power_backend", "") or ""
+        backend_order = {"": 0, "teraguchi": 1, "ssh": 2, "wol": 3}
+        self.backend.setCurrentIndex(backend_order.get(cur, 0))
+        layout.addRow("Backend:", self.backend)
+
+        # OS (relevant for SSH and teraguchi fallback)
+        self.os_combo = QComboBox()
+        self.os_combo.addItem("Linux", "linux")
+        self.os_combo.addItem("Windows", "windows")
+        os_val = getattr(p, "power_os", "linux") or "linux"
+        self.os_combo.setCurrentIndex(0 if os_val == "linux" else 1)
+        self._os_label = QLabel("Remote OS:")
+        layout.addRow(self._os_label, self.os_combo)
+
+        # SSH section — connection target inherited from bookmark (read-only)
+        self._ssh_sep = self._separator("SSH — Power Off / Reboot")
+        layout.addRow(self._ssh_sep)
+
+        # Read-only preview: inherited connection info
+        inherited = f"<code>{conn_user}@{conn_host}:22</code>"
+        self._ssh_target_lbl = QLabel(
+            f"<span style='color:#8888aa'>SSH target (inherited from bookmark):</span><br>{inherited}"
+        )
+        self._ssh_target_lbl.setTextFormat(Qt.RichText)
+        layout.addRow(self._ssh_target_lbl)
+
+        # SSH key — only override that makes sense to expose
+        self._ssh_key_label = QLabel("SSH Key:")
+        self.ssh_key = QLineEdit(getattr(p, "power_ssh_key", "") or "")
+        self.ssh_key.setPlaceholderText("~/.ssh/id_rsa  (empty = SSH agent)")
+        layout.addRow(self._ssh_key_label, self.ssh_key)
+
+        # WoL section
+        self._wol_sep = self._separator("Wake-on-LAN — Power On")
+        layout.addRow(self._wol_sep)
+
+        self._wol_mac_label = QLabel("MAC Address:")
+        self.wol_mac = QLineEdit(getattr(p, "power_wol_mac", "") or "")
+        self.wol_mac.setPlaceholderText("aa:bb:cc:dd:ee:ff")
+        layout.addRow(self._wol_mac_label, self.wol_mac)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addRow(btn_row)
+
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+        self.backend.currentIndexChanged.connect(self._update_visibility)
+        self._update_visibility()
+
+    def _separator(self, text: str) -> QLabel:
+        lbl = QLabel(f"<span style='color:#6c6c8a; font-size:10px'>{text}</span>")
+        lbl.setTextFormat(Qt.RichText)
+        return lbl
+
+    def _update_visibility(self):
+        backend = self.backend.currentData() or ""
+        ssh_visible = backend in ("ssh", "teraguchi")
+        wol_visible = backend in ("ssh", "wol", "teraguchi")
+        os_visible  = backend in ("ssh", "teraguchi")
+
+        for w in (self._ssh_sep, self._ssh_target_lbl, self._ssh_key_label, self.ssh_key):
+            w.setVisible(ssh_visible)
+        for w in (self._wol_sep, self._wol_mac_label, self.wol_mac):
+            w.setVisible(wol_visible)
+        for w in (self._os_label, self.os_combo):
+            w.setVisible(os_visible)
+
+    @property
+    def values(self) -> dict:
+        return {
+            "power_backend":       self.backend.currentData() or "",
+            "power_os":            self.os_combo.currentData() or "linux",
+            "power_ssh_key":       self.ssh_key.text().strip(),
+            "power_wol_mac":       self.wol_mac.text().strip(),
+            # host/user/broadcast intentionally not stored — inherited from profile
+        }
+
+
 class BookmarkPanel(QWidget):
     connect_requested = Signal(str)
+    disconnect_requested = Signal(str)
+    power_action_requested = Signal(str, str)   # (bookmark_id, action)
 
     def __init__(self, bookmark_mgr: BookmarkManager, parent=None):
         super().__init__(parent)
         self._mgr = bookmark_mgr
+        self._active_ids: set = set()
+        self._power_ids: set = set()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -322,11 +482,14 @@ class BookmarkPanel(QWidget):
         layout.addLayout(search_row)
 
         self._list = QListWidget()
-        self._list.setItemDelegate(BookmarkDelegate(self._list))
+        self._list.setItemDelegate(
+            BookmarkDelegate(self._list, self._active_ids, self._power_ids))
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
         self._list.doubleClicked.connect(self._on_double_click)
         self._list.setMouseTracking(True)
+        self._list.viewport().setMouseTracking(True)
+        self._list.viewport().installEventFilter(self)
         self._list.setSpacing(1)
         self._list.setStyleSheet(
             f"QListWidget {{ background: {theme.BG_SECONDARY}; border: none; }}"
@@ -365,8 +528,31 @@ class BookmarkPanel(QWidget):
 
         self._refresh()
 
+    def eventFilter(self, obj, event):
+        """Detect left-click on the left icon zone (server/power icon) of a bookmark row."""
+        from PySide6.QtCore import QEvent
+        if obj is self._list.viewport() and event.type() == QEvent.MouseButtonPress:
+            from PySide6.QtCore import Qt as _Qt
+            if event.button() == _Qt.LeftButton:
+                item = self._list.itemAt(event.pos())
+                if item:
+                    rect = self._list.visualItemRect(item)
+                    # Power zone: left icon area (8px margin + 20px icon + small buffer)
+                    icon_left  = rect.left() + 4   # card starts at rect.left()+4
+                    icon_right = icon_left + 36    # 8px gap + 20px icon + 8px buffer
+                    if icon_left <= event.pos().x() <= icon_right:
+                        bid = item.data(Qt.UserRole)
+                        if bid in self._power_ids:
+                            self._show_power_menu(bid, event.globalPosition().toPoint())
+                        else:
+                            # Not configured yet — open Power Settings directly
+                            self._edit_power(bid)
+                        return True
+        return super().eventFilter(obj, event)
+
     def _refresh(self, _query: str = ""):
         self._list.clear()
+        self._power_ids.clear()
         query = self._search.text().strip()
         items = self._mgr.search(query) if query else self._mgr.list_all()
         for bid, profile in items:
@@ -379,11 +565,19 @@ class BookmarkPanel(QWidget):
             item.setData(Qt.UserRole + 2, host_text)
             item.setSizeHint(QSize(0, 56))
             self._list.addItem(item)
+            # Track which bookmarks have power management configured
+            if getattr(profile, "power_backend", "").strip().lower() not in ("", "none"):
+                self._power_ids.add(bid)
 
     def _on_double_click(self, _index):
         item = self._list.currentItem()
-        if item:
-            self.connect_requested.emit(item.data(Qt.UserRole))
+        if not item:
+            return
+        bid = item.data(Qt.UserRole)
+        if bid in self._active_ids:
+            self.disconnect_requested.emit(bid)
+        else:
+            self.connect_requested.emit(bid)
 
     def _show_context_menu(self, pos):
         item = self._list.itemAt(pos)
@@ -391,14 +585,42 @@ class BookmarkPanel(QWidget):
             return
         bid = item.data(Qt.UserRole)
         menu = QMenu(self)
-        menu.addAction(icons.icon_connect(), "Connect",
-                       lambda: self.connect_requested.emit(bid))
-        menu.addAction(icons.icon_edit(), "Edit",
+        if bid in self._active_ids:
+            menu.addAction(icons.icon_disconnect(), "Disconnect",
+                           lambda: self.disconnect_requested.emit(bid))
+        else:
+            menu.addAction(icons.icon_connect(), "Connect",
+                           lambda: self.connect_requested.emit(bid))
+        # Power submenu (only when backend is configured)
+        if bid in self._power_ids:
+            menu.addSeparator()
+            power_menu = menu.addMenu(icons.icon_power(), "Power")
+            power_menu.addAction("Power On  (WoL)",
+                                 lambda: self.power_action_requested.emit(bid, "power_on"))
+            power_menu.addAction("Power Off",
+                                 lambda: self.power_action_requested.emit(bid, "power_off"))
+            power_menu.addAction("Reboot",
+                                 lambda: self.power_action_requested.emit(bid, "reboot"))
+        menu.addSeparator()
+        menu.addAction(icons.icon_edit(), "Edit Connection",
                        lambda: self._edit_bookmark(bid))
+        menu.addAction(icons.icon_power(), "Power Settings...",
+                       lambda: self._edit_power(bid))
         menu.addSeparator()
         menu.addAction(icons.icon_trash(), "Delete",
                        lambda: self._delete_bookmark(bid))
         menu.exec(self._list.mapToGlobal(pos))
+
+    def _show_power_menu(self, bid: str, global_pos):
+        """Pop-up shown when user left-clicks the power icon inside a row."""
+        menu = QMenu(self)
+        menu.addAction(icons.icon_power(theme.SUCCESS), "Power On  (WoL)",
+                       lambda: self.power_action_requested.emit(bid, "power_on"))
+        menu.addAction(icons.icon_power(theme.WARNING), "Power Off",
+                       lambda: self.power_action_requested.emit(bid, "power_off"))
+        menu.addAction(icons.icon_refresh(), "Reboot",
+                       lambda: self.power_action_requested.emit(bid, "reboot"))
+        menu.exec(global_pos)
 
     def _add_bookmark(self):
         dialog = ConnectionDialog(self)
@@ -433,6 +655,15 @@ class BookmarkPanel(QWidget):
                              use_tls=dialog.use_tls)
             self._refresh()
 
+    def _edit_power(self, bid):
+        profile = self._mgr.get(bid)
+        if not profile:
+            return
+        dlg = PowerSettingsDialog(self, profile)
+        if dlg.exec() == QDialog.Accepted:
+            self._mgr.update(bid, **dlg.values)
+            self._refresh()
+
     def _delete_bookmark(self, bid):
         profile = self._mgr.get(bid)
         if not profile:
@@ -451,6 +682,20 @@ class BookmarkPanel(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export", "bookmarks.json", "JSON (*.json)")
         if path:
             self._mgr.export_bookmarks(path, include_passwords=False)
+
+    def set_active_bookmarks(self, ids: set):
+        """Update the set of bookmark IDs that currently have an active session."""
+        self._active_ids.clear()
+        self._active_ids.update(ids)
+        self._list.viewport().update()
+
+    def refresh_power_ids(self):
+        """Recompute which bookmarks have power management configured."""
+        self._power_ids.clear()
+        for bid, profile in self._mgr.list_all():
+            if getattr(profile, "power_backend", "").strip().lower() not in ("", "none"):
+                self._power_ids.add(bid)
+        self._list.viewport().update()
 
 
 # ════════════════════════════════════════════════════
@@ -579,8 +824,16 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self._bookmark_panel = BookmarkPanel(self._bookmarks)
         self._bookmark_panel.connect_requested.connect(self._connect_bookmark)
+        self._bookmark_panel.disconnect_requested.connect(self._disconnect_by_bookmark_id)
+        self._bookmark_panel.power_action_requested.connect(self._on_power_action)
         self._bookmark_dock.setWidget(self._bookmark_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._bookmark_dock)
+
+        # Restore persisted visibility; default hidden to save screen space
+        self._ui_settings = UISettings.load()
+        if not self._ui_settings.get("bookmarks_visible", False):
+            self._bookmark_dock.hide()
+        self._bookmark_dock.visibilityChanged.connect(self._on_bookmark_dock_visibility)
 
         self._quality_dock = QDockWidget("  Quality", self)
         self._quality_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
@@ -588,6 +841,7 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self._quality_panel = QualityControlPanel()
         self._quality_panel.settings_changed.connect(self._on_quality_changed)
+        self._quality_panel.mic_mute_toggled.connect(self._toggle_mic)
         self._quality_dock.setWidget(self._quality_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self._quality_dock)
         self._quality_dock.hide()
@@ -625,6 +879,7 @@ class MainWindow(QMainWindow):
         self._fs_toolbar.settings_requested.connect(
             lambda: self._quality_dock.setVisible(not self._quality_dock.isVisible()))
         self._fs_toolbar.monitor_selector.selection_changed.connect(self._on_monitors_changed)
+        self._fs_toolbar.mic_toggle_requested.connect(self._toggle_mic)
         self._fs_toolbar.hide()
 
         # ── Timers ──
@@ -681,11 +936,15 @@ class MainWindow(QMainWindow):
             "Refresh Frame", "F5",
             lambda: self._active_session and self._active_session.request_full_frame(),
             icons.icon_refresh()))
+        conn_menu.addSeparator()
+        conn_menu.addAction(self._action(
+            "Mute/Unmute Mic", "M", self._toggle_mic, icons.icon_mic()))
 
         # View menu
         view_menu = mb.addMenu("&View")
         bm_action = self._bookmark_dock.toggleViewAction()
         bm_action.setIcon(icons.icon_bookmark())
+        bm_action.setShortcut(QKeySequence("B"))
         view_menu.addAction(bm_action)
         qc_action = self._quality_dock.toggleViewAction()
         qc_action.setIcon(icons.icon_settings())
@@ -737,6 +996,15 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._monitor_selector)
 
         tb.addSeparator()
+
+        # Mic toggle — icon changes based on state
+        self._mic_action = self._action(
+            "Mute Mic", "M", self._toggle_mic, icons.icon_mic())
+        self._mic_action.setCheckable(True)
+        self._mic_action.setToolTip("Microphone: active (click to mute)")
+        tb.addAction(self._mic_action)
+
+        tb.addSeparator()
         tb.addAction(self._action(
             "Settings", "", lambda: self._quality_dock.setVisible(
                 not self._quality_dock.isVisible()), icons.icon_settings()))
@@ -778,6 +1046,7 @@ class MainWindow(QMainWindow):
         idx = self._tabs.addTab(session.viewer, session.display_name)
         self._sessions[idx] = session
         self._tabs.setCurrentIndex(idx)
+        session.viewer.set_connection_state("connecting", f"{host}:{port}")
 
         # Wire session signals
         session.status_changed.connect(lambda s, i=idx: self._on_session_status(i, s))
@@ -788,6 +1057,7 @@ class MainWindow(QMainWindow):
         session.usb_devices_updated.connect(self._on_usb_devices_updated)
         session.broker_machine_needed.connect(
             lambda machines, s=session: self._on_broker_machine_needed(s, machines))
+        session.mic_state_changed.connect(self._on_mic_state_changed)
 
         if mode == "broker":
             logger.info("Connecting via broker to %s:%d", host, port)
@@ -826,6 +1096,8 @@ class MainWindow(QMainWindow):
             self._status_label.setText("No connections")
             self._health_status.data = HealthData()
 
+        self._bookmark_panel.set_active_bookmarks(self._active_bookmark_ids())
+
     def _on_tab_changed(self, idx):
         session = self._sessions.get(idx)
         if session:
@@ -833,6 +1105,9 @@ class MainWindow(QMainWindow):
             self._status_label.setText(session.display_name)
             if self.isFullScreen():
                 self._fs_toolbar.set_connection_label(session.display_name)
+            # Sync mic UI to newly selected session
+            self._on_mic_state_changed(
+                session.mic_available and not session.mic_muted)
 
     def _on_session_status(self, idx, status):
         session = self._sessions.get(idx)
@@ -843,6 +1118,9 @@ class MainWindow(QMainWindow):
         colors = {"connected": theme.SUCCESS, "connecting": theme.WARNING,
                   "disconnected": theme.TEXT_MUTED, "error": theme.DANGER}
         color = colors.get(status, theme.TEXT_MUTED)
+
+        # Update viewer overlay — clears frozen frame when not streaming
+        session.viewer.set_connection_state(status, session.display_name)
 
         if idx == self._tabs.currentIndex():
             self._status_dot.setStyleSheet(
@@ -855,6 +1133,8 @@ class MainWindow(QMainWindow):
                 self._status_label.setText(f"Disconnected: {session.display_name}")
             elif status == "connecting":
                 self._status_label.setText(f"Connecting: {session.display_name}")
+
+        self._bookmark_panel.set_active_bookmarks(self._active_bookmark_ids())
 
     # ── Actions ──────────────────────────────────
 
@@ -902,6 +1182,92 @@ class MainWindow(QMainWindow):
             profile.host, profile.port, profile.username, password,
             use_tls=profile.use_tls, auto_reconnect=profile.auto_connect,
             bookmark_id=bookmark_id, mode=mode)
+
+    def _active_bookmark_ids(self) -> set:
+        """Return the set of bookmark IDs that currently have a connected session."""
+        return {
+            s._bookmark_id
+            for s in self._sessions.values()
+            if s._bookmark_id and s.is_connected
+        }
+
+    def _disconnect_by_bookmark_id(self, bookmark_id: str):
+        """Disconnect the session associated with a specific bookmark ID."""
+        for idx, session in list(self._sessions.items()):
+            if session._bookmark_id == bookmark_id:
+                if self.isFullScreen():
+                    self._toggle_fullscreen()
+                self._close_tab(idx)
+                return
+
+    def _on_power_action(self, bookmark_id: str, action: str):
+        """Handle a power action request from the bookmark panel."""
+        from client.power_manager import PowerManager, POWER_OFF, REBOOT, POWER_ON
+
+        profile = self._bookmarks.get(bookmark_id)
+        if not profile:
+            return
+
+        # Confirm destructive actions
+        if action in (POWER_OFF, REBOOT):
+            label = "Power off" if action == POWER_OFF else "Reboot"
+            answer = QMessageBox.question(
+                self, f"Confirm {label}",
+                f"{label} <b>{profile.name}</b> ({profile.host})?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        # Find the active session for this bookmark (for teraguchi in-band)
+        def _get_session():
+            for s in self._sessions.values():
+                if s._bookmark_id == bookmark_id and s.is_connected:
+                    return s
+            return None
+
+        pm = PowerManager(profile, _get_session)
+
+        if action == POWER_ON:
+            result = pm.power_on()
+        elif action == POWER_OFF:
+            result = pm.power_off()
+        elif action == REBOOT:
+            result = pm.reboot()
+        else:
+            result = f"Unknown power action: {action!r}"
+
+        self.statusBar().showMessage(result, 6000)
+
+    def _toggle_mic(self):
+        """Mute or unmute the microphone on the active session."""
+        s = self._active_session
+        if s:
+            s.toggle_mic()
+
+    def _on_mic_state_changed(self, active: bool):
+        """Update all mic UI when the session mic state changes."""
+        s = self._active_session
+        available = s.mic_available if s else False
+        device = s.mic_device_name if s else ""
+        # Main toolbar action
+        self._mic_action.setChecked(not active)
+        if active:
+            self._mic_action.setIcon(icons.icon_mic(theme.ACCENT))
+            self._mic_action.setToolTip(
+                f"Mic: {device} (click to mute)" if device else "Mic: active (click to mute)")
+        else:
+            self._mic_action.setIcon(icons.icon_mic_muted())
+            self._mic_action.setToolTip("Mic: muted (click to unmute)")
+        # Status bar
+        mic_text = f"Mic: {device}" if active and device else ("Mic: muted" if not active else "Mic")
+        self.statusBar().showMessage(mic_text, 3000)
+        # Fullscreen toolbar
+        if hasattr(self, "_fs_toolbar"):
+            self._fs_toolbar.update_mic_state(active, device)
+        # Quality panel
+        self._quality_panel.update_mic_status(available, not active, device)
 
     def _disconnect_active(self):
         """Disconnect the active session and close its tab.
@@ -1012,6 +1378,13 @@ class MainWindow(QMainWindow):
         from client.key_diagnostic import KeyDiagnosticDialog
         diag = KeyDiagnosticDialog(self)
         diag.show()
+
+    def _on_bookmark_dock_visibility(self, visible: bool):
+        """Persist bookmark dock visibility — skip saves during fullscreen transitions."""
+        if self.isFullScreen():
+            return
+        self._ui_settings["bookmarks_visible"] = visible
+        UISettings.save(self._ui_settings)
 
     # ── Fullscreen ───────────────────────────────
 

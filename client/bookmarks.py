@@ -238,3 +238,37 @@ class BookmarkManager:
     @property
     def count(self) -> int:
         return len(self._profiles)
+
+
+class UISettings:
+    """Persist lightweight UI state (dock visibility, window layout) to ui_settings.json.
+
+    All methods are class-level; no instantiation needed.
+
+    Usage:
+        data = UISettings.load()
+        data["bookmarks_visible"] = False
+        UISettings.save(data)
+    """
+
+    _FILE = "ui_settings.json"
+
+    @classmethod
+    def _path(cls) -> Path:
+        return _get_config_dir() / cls._FILE
+
+    @classmethod
+    def load(cls) -> dict:
+        try:
+            with open(cls._path()) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    @classmethod
+    def save(cls, data: dict) -> None:
+        try:
+            with open(cls._path(), "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            logger.warning("UISettings: failed to save: %s", exc)

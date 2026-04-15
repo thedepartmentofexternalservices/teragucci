@@ -47,7 +47,7 @@ from common.messages import (
     HealthPing, HealthPong, VideoCodec, ChromaSubsampling,
     VideoFrameFlags, AuthRequest, AuthResult, MonitorListMsg,
     ClipboardMsg, encode_video_header, encode_jpeg_header, encode_audio_header,
-    AudioCodec, parse_message, generate_challenge,
+    AudioCodec, parse_message, generate_challenge, decode_mic_header,
 )
 from common.keymap import qt_key_to_linux_scancode
 from server.platform_backends import (
@@ -60,6 +60,7 @@ from server.platform_backends import (
 from server.cursor_tracker import CursorTracker
 from server.video_encoder import VideoEncoder, JpegFallbackEncoder, check_ffmpeg_available, detect_encoders
 from server.audio_capture import AudioCapture, check_audio_available
+from server.mic_injector import MicInjector
 from server.health import HealthMonitor
 from server.auth import Authenticator
 from server.file_transfer import FileReceiver
@@ -177,6 +178,11 @@ class SessionRuntime:
             self.audio = AudioCapture(bitrate_kbps=quality.audio_bitrate_kbps,
                                       uid=self._uid, gid=self._gid)
 
+        # Microphone injection (client mic → PulseAudio virtual source on server)
+        self.mic_injector: Optional[MicInjector] = None
+        if not no_audio and uid != 0:
+            self.mic_injector = MicInjector(uid=uid, gid=gid)
+
         # Clipboard
         self.clipboard: Optional[ClipboardSync] = None
         if not no_clipboard:
@@ -278,6 +284,9 @@ class SessionRuntime:
         if self.audio and self.audio.available and self.quality.enable_audio:
             self.audio.start(self._on_audio_frame)
 
+        if self.mic_injector:
+            self.mic_injector.start()
+
         if self.clipboard and self.clipboard.available:
             self.clipboard.start_monitoring(self._on_clipboard_change)
 
@@ -288,27 +297,29 @@ class SessionRuntime:
 
     async def _stream_h264(self, fps: int):
         interval = 1.0 / fps
+        loop = asyncio.get_running_loop()
         while self._running:
             start = time.time()
             if self.clients and self.encoder:
                 try:
                     t0 = time.time()
-                    raw = self.capture.capture_raw_bgra()
+                    raw = await loop.run_in_executor(None, self.capture.capture_raw_bgra)
                     self.health.record_capture_time((time.time() - t0) * 1000)
-                    self.encoder.feed_frame(raw)
+                    await loop.run_in_executor(None, self.encoder.feed_frame, raw)
                 except Exception as e:
                     logger.error("[%s] H264 capture error: %s", self.username, e)
             elapsed = time.time() - start
-            await asyncio.sleep(max(interval - elapsed, 0.001))
+            await asyncio.sleep(max(interval - elapsed, 0))
 
     async def _stream_jpeg(self, fps: int):
         interval = 1.0 / fps
+        loop = asyncio.get_running_loop()
         while self._running:
             start = time.time()
             if self.clients:
                 try:
                     t0 = time.time()
-                    regions = self.capture.capture_dirty_regions()
+                    regions = await loop.run_in_executor(None, self.capture.capture_dirty_regions)
                     self.health.record_capture_time((time.time() - t0) * 1000)
                     for x, y, w, h, jpeg_data in regions:
                         ft = (FrameType.VIDEO_FULL
@@ -325,7 +336,7 @@ class SessionRuntime:
                 except Exception as e:
                     logger.error("[%s] JPEG capture error: %s", self.username, e)
             elapsed = time.time() - start
-            await asyncio.sleep(max(interval - elapsed, 0.001))
+            await asyncio.sleep(max(interval - elapsed, 0))
 
     async def _health_ping_loop(self):
         while self._running:
@@ -593,6 +604,20 @@ class SessionRuntime:
                 if response:
                     self._send_to_client(session, response)
 
+        elif msg_type == MsgType.POWER_ACTION:
+            import subprocess as _sp
+            action = msg.get("action", "")
+            if action == "power_off":
+                logger.info("Power action: shutdown requested by client %s",
+                            session.client_host)
+                _sp.Popen(["sudo", "systemctl", "poweroff"])
+            elif action == "reboot":
+                logger.info("Power action: reboot requested by client %s",
+                            session.client_host)
+                _sp.Popen(["sudo", "systemctl", "reboot"])
+            else:
+                logger.warning("Unknown POWER_ACTION %r — ignored", action)
+
         elif msg_type == MsgType.CLIENT_HELLO:
             session.supports_h264 = msg.get("supports_h264", True)
             session.supports_h265 = msg.get("supports_h265", False)
@@ -617,6 +642,8 @@ class SessionRuntime:
             self.encoder.stop()
         if self.audio:
             self.audio.stop()
+        if self.mic_injector:
+            self.mic_injector.stop()
         if self.clipboard:
             self.clipboard.stop()
         if self.cursor_tracker:
@@ -878,6 +905,14 @@ async def handle_client(websocket: WebSocketServerProtocol):
                     logger.warning("Invalid JSON from %s", addr)
                 except Exception as e:
                     logger.error("Error from %s: %s", addr, e)
+            elif isinstance(message, bytes) and len(message) > 0:
+                frame_type = message[0]
+                if frame_type == FrameType.MIC and runtime.mic_injector:
+                    try:
+                        _, _, pcm = decode_mic_header(message)
+                        runtime.mic_injector.write(pcm)
+                    except Exception as e:
+                        logger.debug("Mic frame error: %s", e)
 
     except asyncio.TimeoutError:
         logger.warning("Client %s: auth timeout", addr)
@@ -899,7 +934,7 @@ broker_secret: str = ""  # Shared secret for broker token verification
 # HTTP Status Endpoint (for broker health probes)
 # ═══════════════════════════════════════════════════════════════
 
-def handle_http(connection, request):
+async def handle_http(connection, request):
     """
     Handle HTTP requests (non-WebSocket) via process_request hook.
 

@@ -46,7 +46,8 @@ class FrameType(IntEnum):
     VIDEO_H264 = 0x03       # H.264 NAL unit
     VIDEO_H265 = 0x04       # H.265 NAL unit
     VIDEO_AV1 = 0x05        # AV1 OBU frame
-    AUDIO = 0x10            # Audio frame
+    AUDIO = 0x10            # Audio frame (server → client)
+    MIC = 0x11              # Microphone audio frame (client → server)
 
 
 class VideoCodec(IntEnum):
@@ -77,6 +78,7 @@ class VideoFrameFlags(IntEnum):
 # Binary headers
 VIDEO_HEADER_SIZE = 10  # type(1) + codec(1) + chroma(1) + flags(1) + timestamp(4) + monitor(2)
 AUDIO_HEADER_SIZE = 8   # type(1) + codec(1) + reserved(2) + timestamp(4)
+MIC_HEADER_SIZE = 8     # type(1) + codec(1) + reserved(2) + timestamp(4)  [same layout as AUDIO]
 JPEG_HEADER_SIZE = 9    # type(1) + x(2) + y(2) + w(2) + h(2) — legacy compat
 
 
@@ -101,6 +103,17 @@ def decode_audio_header(data: bytes) -> tuple:
     """Returns (codec, timestamp_ms, payload)"""
     _, codec, _, ts = struct.unpack("!BBHI", data[:AUDIO_HEADER_SIZE])
     return AudioCodec(codec), ts, data[AUDIO_HEADER_SIZE:]
+
+
+def encode_mic_header(codec: AudioCodec, timestamp_ms: int) -> bytes:
+    """Encode microphone frame header (client → server)."""
+    return struct.pack("!BBHI", FrameType.MIC, codec, 0, timestamp_ms)
+
+
+def decode_mic_header(data: bytes) -> tuple:
+    """Returns (codec, timestamp_ms, payload)"""
+    _, codec, _, ts = struct.unpack("!BBHI", data[:MIC_HEADER_SIZE])
+    return AudioCodec(codec), ts, data[MIC_HEADER_SIZE:]
 
 
 # Legacy JPEG frame compat
@@ -175,6 +188,10 @@ class MsgType:
     BROKER_MACHINE_REQUEST = "broker_machine_request"  # Client → Broker: request specific machine
     BROKER_STATUS = "broker_status"            # Client → Broker: request status refresh
     BROKER_RELEASE = "broker_release"          # Client → Broker: release machine assignment
+
+    # --- Power Management (Client → Server) ---
+    # Server executes the action on the local machine (requires sudo privileges)
+    POWER_ACTION = "power_action"              # action: "power_off" | "reboot"
 
 
 # ============================================================
@@ -513,6 +530,23 @@ class ConnectionProfile:
     created: str = ""
     color_label: str = ""  # For visual organization
     mode: str = "direct"  # "direct" or "broker"
+
+    # Power management (optional — leave empty to disable)
+    # power_backend: "ssh" | "wol" | "teraguchi" | "none" | ""
+    #   ssh       — SSH commands for off/reboot; wol_mac for power-on
+    #   wol       — Wake-on-LAN only (power-on); no off/reboot
+    #   teraguchi — in-band off/reboot via live session; falls back to ssh
+    #   none / "" — power buttons hidden
+    power_backend: str = ""
+    power_os: str = "linux"              # "linux" | "windows" (controls shutdown command)
+    # SSH overrides — normally empty; host/user are inherited from profile.host/username
+    power_ssh_host: str = ""            # override SSH host (e.g. bastion); empty = profile.host
+    power_ssh_user: str = ""            # override SSH user; empty = profile.username
+    power_ssh_port: int = 22            # SSH port (always 22, not the teraguchi streaming port)
+    power_ssh_key: str = ""             # path to SSH private key; empty = SSH agent
+    # Wake-on-LAN
+    power_wol_mac: str = ""             # MAC address for WoL (e.g. "aa:bb:cc:dd:ee:ff")
+    power_wol_broadcast: str = "255.255.255.255"
 
     def to_dict(self) -> dict:
         return asdict(self)

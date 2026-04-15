@@ -185,6 +185,16 @@ class ClientProtocol:
         except Exception as e:
             logger.debug("Send error: %s", e)
 
+    def send_binary(self, data: bytes):
+        """Send a binary frame to the server (e.g. microphone audio). Thread-safe."""
+        if not self._connected or not self._ws:
+            return
+        try:
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._ws.send(data), self._loop)
+        except Exception as e:
+            logger.debug("Send binary error: %s", e)
+
     def send_quality_settings(self, settings: QualitySettings):
         self.send_input(json.loads(settings.to_json()))
 

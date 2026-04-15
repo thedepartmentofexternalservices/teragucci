@@ -33,6 +33,7 @@ class QualityControlPanel(QWidget):
     """
 
     settings_changed = Signal(object)  # QualitySettings
+    mic_mute_toggled = Signal()         # user clicked mic toggle
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,6 +128,25 @@ class QualityControlPanel(QWidget):
 
         layout.addWidget(audio_group)
 
+        # === Microphone Settings ===
+        mic_group = QGroupBox("Microphone")
+        mic_layout = QFormLayout(mic_group)
+
+        self._mic_check = QCheckBox("Send microphone to remote")
+        self._mic_check.setChecked(True)
+        self._mic_check.setToolTip(
+            "When enabled, your microphone audio is streamed to the remote machine.\n"
+            "Disable to mute yourself without affecting remote audio playback."
+        )
+        self._mic_check.stateChanged.connect(self._on_mic_check_changed)
+        mic_layout.addRow(self._mic_check)
+
+        self._mic_device_label = QLabel("No microphone detected")
+        self._mic_device_label.setStyleSheet("color: #8b8ba3; font-size: 11px;")
+        mic_layout.addRow("Device:", self._mic_device_label)
+
+        layout.addWidget(mic_group)
+
         # === Preset Buttons ===
         presets_layout = QHBoxLayout()
 
@@ -143,6 +163,24 @@ class QualityControlPanel(QWidget):
 
         layout.addLayout(presets_layout)
         layout.addStretch()
+
+    def _on_mic_check_changed(self, state):
+        if not self._building:
+            self.mic_mute_toggled.emit()
+
+    def update_mic_status(self, available: bool, muted: bool, device_name: str = ""):
+        """Called by MainWindow to reflect the session's current mic state."""
+        self._building = True
+        self._mic_check.setChecked(not muted)
+        self._mic_check.setEnabled(available)
+        if not available:
+            self._mic_device_label.setText("No microphone detected")
+            self._mic_device_label.setStyleSheet("color: #8b8ba3; font-size: 11px;")
+        else:
+            self._mic_device_label.setText(device_name or "Default input device")
+            color = "#00c878" if not muted else "#8b8ba3"
+            self._mic_device_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self._building = False
 
     def _on_quality_changed(self, value: int):
         bias = value / 100.0
