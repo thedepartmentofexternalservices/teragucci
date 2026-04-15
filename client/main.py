@@ -778,6 +778,7 @@ class MainWindow(QMainWindow):
         idx = self._tabs.addTab(session.viewer, session.display_name)
         self._sessions[idx] = session
         self._tabs.setCurrentIndex(idx)
+        session.viewer.set_connection_state("connecting", f"{host}:{port}")
 
         # Wire session signals
         session.status_changed.connect(lambda s, i=idx: self._on_session_status(i, s))
@@ -843,6 +844,9 @@ class MainWindow(QMainWindow):
         colors = {"connected": theme.SUCCESS, "connecting": theme.WARNING,
                   "disconnected": theme.TEXT_MUTED, "error": theme.DANGER}
         color = colors.get(status, theme.TEXT_MUTED)
+
+        # Update viewer overlay — clears frozen frame when not streaming
+        session.viewer.set_connection_state(status, session.display_name)
 
         if idx == self._tabs.currentIndex():
             self._status_dot.setStyleSheet(
