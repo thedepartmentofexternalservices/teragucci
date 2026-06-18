@@ -109,18 +109,99 @@ class BookmarkManager:
             try:
                 with open(self._bookmarks_file) as f:
                     data = json.load(f)
+                migrated = False
                 for bid, pdata in data.items():
                     self._profiles[bid] = ConnectionProfile.from_dict(pdata)
+                    # Phase 2 D-10 migration — pre-Phase-2 bookmarks did not
+                    # carry destination_kind / swap_cmd_ctrl. The dataclass
+                    # default lands swap_cmd_ctrl=True (correct for Linux),
+                    # but if the saved JSON omits the field entirely AND the
+                    # destination is a Mac, the default is wrong. We can't
+                    # actually tell Linux from Mac just from the host string
+                    # so we honor the saved file and default to Linux/swap-on
+                    # — which matches the v1 plan where the Flame production
+                    # server is Rocky Linux. The user can flip the per-bookmark
+                    # checkbox in the editor if they want Mac-server behavior.
+                    if "swap_cmd_ctrl" not in pdata or "destination_kind" not in pdata:
+                        migrated = True
+                        # Re-apply defaults consistent with the destination kind.
+                        prof = self._profiles[bid]
+                        if prof.destination_kind == "mac":
+                            prof.swap_cmd_ctrl = pdata.get("swap_cmd_ctrl", False)
+                        else:
+                            prof.swap_cmd_ctrl = pdata.get("swap_cmd_ctrl", True)
+
+                    # Phase 3 D-01 / D-15 migration — pre-Phase-3 bookmarks
+                    # lack the new display + clipboard fields. Dataclass
+                    # defaults already pick the safe values (mirror_all +
+                    # all clipboard toggles ON per D-16), but we mark the
+                    # bookmark as migrated so _save() persists the new
+                    # shape on this load — that prevents a subtle "user
+                    # enables a toggle but it never persists because the
+                    # field was never in the JSON" bug (Pitfall 9).
+                    phase3_fields = (
+                        "monitor_mode", "picked_monitor_id",
+                        "picked_monitor_name",
+                        "clipboard_text_c2s", "clipboard_text_s2c",
+                        "clipboard_image_c2s", "clipboard_image_s2c",
+                    )
+                    if any(f not in pdata for f in phase3_fields):
+                        migrated = True
+
+                    # Phase 3 T-03-05 (STRIDE) — hand-edited JSON could
+                    # drop a tampered ``monitor_mode`` value through
+                    # ``ConnectionProfile.from_dict``; the dataclass
+                    # has no enum enforcement. Whitelist-check here
+                    # and revert to mirror_all with a logged warning.
+                    prof = self._profiles[bid]
+                    if prof.monitor_mode not in ("single", "mirror_all",
+                                                 "pick_one"):
+                        logger.warning(
+                            "bookmark.invalid_monitor_mode bid=%s mode=%r "
+                            "→ mirror_all", bid, prof.monitor_mode)
+                        prof.monitor_mode = "mirror_all"
+                        migrated = True
                 logger.info("Loaded %d bookmarks", len(self._profiles))
+                if migrated:
+                    self._save()
             except Exception as e:
                 logger.error("Failed to load bookmarks: %s", e)
 
+    @staticmethod
+    def default_swap_for_destination(destination_kind: str) -> bool:
+        """Phase 2 D-10 default-swap policy for new bookmarks.
+
+        Mac client → Linux server: Cmd↔Ctrl swap ON by default so Flame
+        on Rocky sees Ctrl+S where the artist pressed Cmd+S.
+
+        Mac client → Mac server: swap OFF by default — no translation
+        needed because the destination interprets Cmd natively.
+        """
+        return destination_kind != "mac"
+
     def _save(self):
-        """Save bookmarks to disk."""
+        """Save bookmarks to disk atomically.
+
+        Phase 2 WR-01: a crash mid-write previously left a truncated
+        ``bookmarks.json`` which `_load()` then silently tossed (the bare
+        ``except Exception`` returns empty), wiping every saved bookmark
+        with no warning. Use the standard write-tmp + fsync + os.replace
+        pattern so the readable file is always fully-written.
+
+        Note: this does not address multi-process write coordination
+        (two simultaneous client instances on the same home directory
+        would still last-writer-wins). Per-bookmark file or fcntl.flock
+        is the next step if that surfaces; for now the single-client
+        case is the documented v1 path.
+        """
         try:
             data = {bid: p.to_dict() for bid, p in self._profiles.items()}
-            with open(self._bookmarks_file, "w") as f:
+            tmp = self._bookmarks_file.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._bookmarks_file)
         except Exception as e:
             logger.error("Failed to save bookmarks: %s", e)
 
@@ -135,6 +216,16 @@ class BookmarkManager:
         bid = str(uuid.uuid4())[:8]
         now = time.strftime("%Y-%m-%d %H:%M:%S")
 
+        # Phase 2 D-10 — if the caller specified destination_kind but did
+        # NOT explicitly pass swap_cmd_ctrl, set the swap default from the
+        # destination policy. Lets the connection dialog stay simple
+        # (just pick Linux vs Mac, swap follows automatically) while still
+        # letting power users pass an explicit override.
+        if "destination_kind" in kwargs and "swap_cmd_ctrl" not in kwargs:
+            kwargs["swap_cmd_ctrl"] = self.default_swap_for_destination(
+                kwargs["destination_kind"]
+            )
+
         profile = ConnectionProfile(
             name=name,
             host=host,
@@ -147,7 +238,8 @@ class BookmarkManager:
         )
         self._profiles[bid] = profile
         self._save()
-        logger.info("Bookmark added: %s (%s:%d)", name, host, port)
+        logger.info("Bookmark added: %s (%s:%d, swap_cmd_ctrl=%s)",
+                    name, host, port, profile.swap_cmd_ctrl)
         return bid
 
     def update(self, bookmark_id: str, **kwargs):

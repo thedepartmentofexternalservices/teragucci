@@ -118,6 +118,19 @@ def icon_monitor(color="#8b8ba3"):
         '<line x1="8" y1="21" x2="16" y2="21"/>'
         '<line x1="12" y1="17" x2="12" y2="21"/>', color)
 
+def icon_clipboard(color="#8b8ba3"):
+    """Clipboard silhouette — copy/paste direction toggles (Phase 3 D-15).
+
+    24×24 viewBox + 1.5 px stroke convention. UI-SPEC Surface 7 SVG body
+    verbatim; consumed by Plan 06's clipboard toolbar toggle button and
+    by Plan 05's oversize-image toast (Surface 8).
+    """
+    return _svg_icon(
+        '<rect x="7" y="3" width="10" height="4" rx="1"/>'
+        '<rect x="4" y="5" width="16" height="16" rx="2"/>'
+        '<line x1="8" y1="11" x2="16" y2="11"/>'
+        '<line x1="8" y1="15" x2="14" y2="15"/>', color)
+
 # ── Status ────────────────────────────────────────────
 
 def icon_power(color="#8b8ba3"):

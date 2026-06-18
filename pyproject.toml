@@ -5,20 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "teraguchi"
 version = "3.0.0"
-description = "Open-source remote desktop for creative professionals — GPU-accelerated H.264/H.265/AV1 with YUV 4:4:4, full Wacom pen pressure, USB passthrough, file transfer, and per-user session isolation. Replaces Teradici PCoIP, HP Anywhere, Parsec, and HP RGS."
-requires-python = ">=3.10"
-license = {text = "MIT"}
+description = "Open-source high-performance remote workstation for VFX / Flame workflows — replaces HP Anyware / PCoIP."
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
 
 [project.optional-dependencies]
 server = [
-    "websockets>=12.0",
+    "websockets>=15.0,<16",
     "mss>=9.0",
-    "numpy>=1.24",
+    "numpy>=2.1,<3",
     "Pillow>=10.0",
 ]
 client = [
-    "websockets>=12.0",
-    "PySide6>=6.6",
+    "websockets>=15.0,<16",
+    "PySide6>=6.10",
 ]
 
 [project.scripts]
@@ -27,3 +27,62 @@ teraguchi-client = "client.main:main"
 
 [tool.setuptools.packages.find]
 include = ["server*", "client*", "common*"]
+
+[tool.pytest.ini_options]
+# STAB-01 pytest config. asyncio_mode="auto" means every `async def test_*`
+# runs under asyncio automatically (no per-test @pytest.mark.asyncio needed).
+# See RESEARCH §"Pitfall 3".
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 30
+# Registered markers — unknown markers otherwise emit PytestUnknownMarkWarning.
+# latency_bench: D-08 synthetic-stage-time accumulator (Plan 01-16); slow
+# (~25 s for 1000 iterations), excluded from the regular PR test suite via
+# `-m "not latency_bench"` and run only in the dedicated `latency-bench`
+# CI job.
+markers = [
+    "latency_bench: synthetic-stage-time latency benchmark (D-08 gate; slow, excluded from PR test suite)",
+    "smoke_1h: STAB-09 1-hour synthetic smoke harness (D-17; nightly-only via .github/workflows/smoke-nightly.yml)",
+    "flame_critical: Flame-artist critical hotkey chord subset (INPUT-04)",
+    "wacom_hw: real Wacom hardware required - DESELECTED from default suite (INPUT-09..12)",
+    "ten_bit_smoke: 10-bit pipeline 9-checkpoint harness (VIDEO-01/02)",
+    "gpu: requires real GPU - DESELECTED from GHA (VIDEO-01/02 cp.7-9)",
+]
+# Phase 2 Wave 0 (02-01 Task 3) - deselect wacom_hw by default. Every
+# other marker remains opt-in via -m flag on the relevant CI job.
+addopts = "-m 'not wacom_hw'"
+# filterwarnings ratchet — see RESEARCH Pitfall 6 + Pitfall 9.
+# Start permissive; tighten dep-bump-by-dep-bump.
+filterwarnings = [
+    "ignore::ResourceWarning",
+    "ignore:SSL shutdown error:Warning",
+    "ignore::DeprecationWarning:aioquic.*",
+    "ignore::DeprecationWarning:websockets.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Files to exclude from lint (third-party vendor copies if any appear later)
+extend-exclude = [
+    "server/nvfbc/build/",    # C helper artifacts
+    ".venv/",
+]
+
+[tool.ruff.lint]
+# Keep the rule set tight and actionable. Expand in later phases.
+select = ["E", "F", "W", "I", "UP", "ASYNC"]
+# Allow `Optional[...]` / `List[...]` / `Dict[...]` style — the codebase uses it
+# pervasively (see codebase/CONVENTIONS.md §"Type Hints"). Phase 2+ can tighten.
+ignore = ["UP006", "UP007", "UP035"]
+
+[tool.mypy]
+# Strict-mode scope starts narrow per RESEARCH §"Standard Stack" (mypy row):
+# "strict only on common/ + client/protocol.py + new FSM module for Phase 1".
+# Wider scope lands in later phases as modules stabilize.
+python_version = "3.12"
+strict_optional = true
+files = ["common", "client/protocol.py"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = false        # lifted progressively

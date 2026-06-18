@@ -141,7 +141,22 @@ def find_edid_file() -> str:
 
 
 def _generate_edid(path: str, width: int, height: int):
-    """Generate a minimal EDID 1.3 binary for a given resolution."""
+    """Generate a minimal EDID 1.3 binary for a given resolution.
+
+    Phase 3 DISP-04 — the generator now emits an "Eizo CG279X" monitor
+    profile (11 ASCII chars, fits the 13-byte EDID descriptor #2) +
+    matching Eizo manufacturer ID "ENC". The Eizo CG279X is an
+    industry-standard 27" 10-bit grading monitor; Flame's monitor-
+    config dialog accepts the descriptor without raising the
+    "unrecognized monitor" warning that the previous "TGC"/"Teraguchi"
+    combination triggered. The resolution is not load-bearing for Flame
+    acceptance — any sensible EDID 1.3 block with a named monitor
+    descriptor passes the dialog.
+
+    If a studio wants a different profile, drop a custom .bin in
+    server/edid/ and find_edid_file picks it up first. The generator
+    stays as a fallback path for users without a shipped EDID binary.
+    """
     # Standard EDID 1.3 block (128 bytes)
     # This creates a basic monitor profile that NVIDIA's driver will accept
     edid = bytearray(128)
@@ -149,10 +164,12 @@ def _generate_edid(path: str, width: int, height: int):
     # Header
     edid[0:8] = b'\x00\xff\xff\xff\xff\xff\xff\x00'
 
-    # Manufacturer ID "TGC" (Teraguchi) - encoded as 2 bytes
-    # T=20, G=7, C=3 -> ((20-1)<<10) | ((7-1)<<5) | (3-1) = 0x4CC2
-    edid[8] = 0x4C
-    edid[9] = 0xC2
+    # Phase 3 DISP-04 — Eizo manufacturer ID (PnP code "ENC") to match
+    # the monitor name descriptor below. Flame parses both fields
+    # independently; matching them avoids mismatched-vendor warnings.
+    # E=5, N=14, C=3 -> ((5-1)<<10) | ((14-1)<<5) | (3-1) = 0x11A2
+    edid[8] = 0x11
+    edid[9] = 0xA2
 
     # Product code
     edid[10] = 0x01
@@ -232,10 +249,14 @@ def _generate_edid(path: str, width: int, height: int):
     edid[dtd_offset + 17] = 0x1E  # flags: digital separate sync, +hsync +vsync
 
     # Descriptor #2: Monitor name
+    # Phase 3 DISP-04 — "Eizo CG279X" is industry-standard for VFX
+    # grading/finishing; Flame's monitor-config dialog accepts the
+    # descriptor without complaint. 11 ASCII chars, fits the 13-byte
+    # EDID descriptor.
     name_offset = 72
     edid[name_offset:name_offset + 5] = b'\x00\x00\x00\xFC\x00'
-    name = "Teraguchi"
-    name_bytes = name.encode('ascii')[:13].ljust(13, b'\x0a')
+    name = "Eizo CG279X"
+    name_bytes = (name.encode('ascii')[:12] + b'\x0a').ljust(13, b'\x20')
     edid[name_offset + 5:name_offset + 18] = name_bytes
 
     # Descriptor #3: Monitor range limits
@@ -360,6 +381,37 @@ class SessionManager:
             del self._sessions[username]
         return None
 
+    def _disable_x_key_repeat(self, display: str, xauthority: str = "") -> None:
+        """Phase 2 D-13 — turn off X server's auto key repeat.
+
+        Teraguchi uses client-driven repeats: the client sends explicit
+        N press events when the user holds a key, and a network stall
+        causes the repeat sequence to STOP mid-air rather than runaway
+        on the server side. Matches PCoIP behavior. Failure is logged
+        and tolerated — best-effort only.
+        """
+        env = {"DISPLAY": display, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if xauthority:
+            env["XAUTHORITY"] = xauthority
+        try:
+            subprocess.run(
+                ["xset", "-display", display, "r", "off"],
+                check=False, timeout=2, env=env,
+                capture_output=True,
+            )
+            logger.info(
+                "session_manager.xset_repeat_off display=%s", display
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "session_manager.xset_not_installed — install xorg-x11-server-utils"
+            )
+        except Exception as e:
+            logger.warning(
+                "session_manager.xset_repeat_off_failed display=%s err=%s",
+                display, e,
+            )
+
     def create_session(self, username: str, uid: int, gid: int, home: str,
                        width: int = 0, height: int = 0) -> UserSession:
         """Create a new X session for a user, or return existing one."""
@@ -420,6 +472,13 @@ class SessionManager:
             xorg_proc=xorg_proc, gpu_display=gpu_display,
             xauthority=xauthority,
             pen_tablet=pen_tablet, pen_tablet_event=pen_tablet_event)
+
+        # Phase 2 D-13 — turn off X auto-key-repeat right after the X
+        # server is up. Teraguchi drives repeats from the client; leaving
+        # X server-side repeat on causes runaway when a packet stalls.
+        # Run BEFORE the WM / D-Bus boot so the very first key event the
+        # WM sees already lives in the no-repeat regime.
+        self._disable_x_key_repeat(display, xauthority)
 
         # Start D-Bus session for the user
         self._start_dbus(session)

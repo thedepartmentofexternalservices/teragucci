@@ -13,12 +13,34 @@ Shows connection quality metrics as an overlay and in the status bar:
 import time
 import collections
 import logging
+from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF
 from PySide6.QtGui import QPainter, QColor, QFont, QPen
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QGridLayout, QFrame
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# D-03: color-capability badge for the health overlay
+# ---------------------------------------------------------------------------
+
+
+def render_color_badge(color_caps: Any) -> str:
+    """Render the '10-bit: <state>' badge line from ServerHelloMsg.color_caps.
+
+    Accepts either a dataclass (ServerColorCaps) or a plain dict (the
+    client-side parsed JSON before dataclass promotion). Defaults to
+    'not_supported' when the field is missing — the conservative
+    degraded-UX answer per D-03.
+    """
+    state = getattr(color_caps, "negotiated_state", None)
+    if state is None and isinstance(color_caps, dict):
+        state = color_caps.get("negotiated_state")
+    if not state:
+        state = "not_supported"
+    return f"10-bit: {state}"
 
 
 class HealthData:
@@ -46,6 +68,13 @@ class HealthData:
         self.packet_loss_pct: float = 0.0
         self.jitter_ms: float = 0.0
         self.buffer_depth_ms: float = 0.0
+
+        # D-03: server-advertised color capability negotiation. Populated
+        # from ServerHelloMsg.color_caps on handshake. Rendered as the
+        # '10-bit: <state>' badge in the overlay. The value can be a
+        # ServerColorCaps dataclass (once common.messages lands it) or a
+        # plain dict parsed off the wire.
+        self.color_caps: Any = None
 
         # Local measurements
         self._ping_times: collections.deque = collections.deque(maxlen=60)
@@ -138,7 +167,7 @@ class HealthOverlay(QWidget):
         # Background — semi-transparent panel with subtle border
         margin = 12
         box_w = 280
-        box_h = 370
+        box_h = 388  # +18 for the '10-bit: <state>' badge line (D-03)
         x = self.width() - box_w - margin
         y = margin
 
@@ -174,6 +203,11 @@ class HealthOverlay(QWidget):
         transport = "UDP" if d.transport_mode == "udp" else "TCP"
         enc_info = d.encoder_backend.upper() if d.encoder_backend else "SW"
         dec_info = d.decoder_backend.upper() if d.decoder_backend else "SW"
+        color_badge = (
+            render_color_badge(d.color_caps)
+            if d.color_caps is not None
+            else "10-bit: not_supported"
+        )
         lines = [
             f"Transport:  {transport}",
             f"Latency:    {d.rtt_ms:.0f} ms",
@@ -181,6 +215,7 @@ class HealthOverlay(QWidget):
             f"Local FPS:  {d.local_fps:.0f}",
             f"Bandwidth:  {d.bandwidth_mbps:.1f} Mbps",
             f"Codec:      {d.codec.upper()} {d.chroma.upper()}",
+            color_badge,
             f"Encoder:    {enc_info}",
             f"Decoder:    {dec_info}",
             f"Resolution: {d.resolution}",

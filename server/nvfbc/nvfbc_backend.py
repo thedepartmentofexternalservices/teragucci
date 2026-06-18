@@ -77,7 +77,18 @@ class NvFBCBackend:
                  with_cursor: bool = False,
                  push_model: bool = True,
                  direct_capture: bool = False,
+                 want_10bit: bool = False,
                  startup_timeout: float = 5.0):
+        """Spawn the nvfbc_capture helper.
+
+        Phase 2 VIDEO-09: ``want_10bit=True`` requests a YUV420P10LE
+        capture surface. The helper compiles the 10-bit path under
+        ``#ifdef NVFBC_BUFFER_FORMAT_YUV420P10LE`` so older NvFBC SDKs
+        silently fall through to BGRA + emit a warning to stderr; the
+        Python side logs the warning but otherwise treats the helper as
+        successful (the parent ``ScreenCapture`` carries the degraded
+        capability state separately).
+        """
         if not helper_available():
             raise RuntimeError(
                 f"nvfbc_capture helper not found at {_HELPER_BIN} — "
@@ -102,9 +113,14 @@ class NvFBCBackend:
             "--with-cursor", "1" if with_cursor else "0",
             "--push", "1" if push_model else "0",
             "--direct-capture", "1" if direct_capture else "0",
+            "--want-10bit", "1" if want_10bit else "0",
         ]
         if display:
             args.extend(["--display", display])
+        # Stash for the parent ScreenCapture to surface the actual
+        # surface format we asked for (the runtime SDK guard may have
+        # overridden it back to BGRA, which is reported via stderr).
+        self._want_10bit = bool(want_10bit)
 
         env = os.environ.copy()
         if display:
@@ -229,11 +245,34 @@ class NvFBCBackend:
                 logger.error("NvFBC framing lost: bad magic %r — bailing",
                              magic)
                 break
-            # Sanity check on size — a single BGRA frame shouldn't be
-            # larger than say 8K@RGBA = ~130 MB. Reject anything wild
-            # so a corrupt header doesn't make us allocate a petabyte.
-            if sz == 0 or sz > 256 * 1024 * 1024:
-                logger.error("NvFBC rejected absurd frame size %d", sz)
+            # Phase 2 WR-07: derive the size cap from the frame geometry
+            # rather than a hardcoded 256 MB constant. The previous cap
+            # was fine for 8K BGRA but YUV420P10LE @ 8K is ~200 MB
+            # (sneaks under) and 16K oversampled-capture would silently
+            # break the reader by hitting the hardcoded limit.
+            #
+            # Cap = w * h * 8 bytes-per-pixel * 2 safety_margin. Picks
+            # the worst case (4:4:4 16-bit per channel = 8 BPP) so any
+            # legitimate format passes; 2x safety so a single
+            # bit-flipped header that doesn't fully blow the format
+            # check still gets caught before we ask the OS for tens of
+            # gigs.
+            #
+            # Absolute floor of 4 MB so we still reject obviously-bogus
+            # tiny-frame + huge-size combos when w/h are unset (first
+            # frame, ``self._width == 0``).
+            if w > 0 and h > 0:
+                derived_cap = max(4 * 1024 * 1024, w * h * 8 * 2)
+            else:
+                # No geometry yet — fall back to the legacy absolute
+                # cap so the first frame still has SOMETHING to gate on.
+                derived_cap = 256 * 1024 * 1024
+            if sz == 0 or sz > derived_cap:
+                logger.error(
+                    "NvFBC rejected absurd frame size %d "
+                    "(derived_cap=%d, w=%d, h=%d) — bailing reader",
+                    sz, derived_cap, w, h,
+                )
                 break
             payload = self._read_exact(fd, sz)
             if payload is None:

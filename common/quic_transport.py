@@ -399,18 +399,33 @@ class QUICTransportClient:
             return self._protocol.stats
         return None
 
-    async def connect(self, host: str, port: int, verify_cert: bool = False):
-        """Connect to the QUIC server."""
+    async def connect(self, host: str, port: int, verify_cert: bool = True):
+        """Connect to the QUIC server.
+
+        SEC-01: ``verify_cert`` defaults to True (verification ON). The only
+        way to disable verification is via the double-gate — the caller must
+        explicitly pass ``verify_cert=False`` AND the environment must set
+        ``TERAGUCHI_ACCEPT_INSECURE=1``. Both conditions emit an ERROR-level
+        ``transport.insecure_mode_active`` log event.
+        """
         if not HAS_QUIC:
             raise RuntimeError("aioquic not installed")
+
+        from common.tls_opt_out import insecure_tls_allowed
 
         config = QuicConfiguration(
             is_client=True,
             max_datagram_frame_size=65536,
         )
         config.alpn_protocols = ["teraguchi"]
+        config.verify_mode = ssl.CERT_REQUIRED  # SEC-01: verification ON by default.
 
-        if not verify_cert:
+        # Double-gated dev escape hatch. ``verify_cert=False`` is treated as
+        # the --insecure-skip-verify CLI flag; TERAGUCHI_ACCEPT_INSECURE=1
+        # must ALSO be set in the environment.
+        if not verify_cert and insecure_tls_allowed(cli_flag=True):
+            logger.error(
+                "transport.insecure_mode_active site=quic env=TERAGUCHI_ACCEPT_INSECURE")
             config.verify_mode = ssl.CERT_NONE
 
         def create_protocol(*args, **kwargs):

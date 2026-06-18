@@ -4,6 +4,8 @@ __pycache__/
 dist/
 build/
 *.spec
+# Allow RPM specs in packaging/ to be tracked (Phase 1 STAB-03)
+!packaging/*.spec
 .venv/
 venv/
 .env
@@ -12,3 +14,6 @@ venv/
 # Compiled NvFBC capture helper (built per-host by install-server.sh)
 server/nvfbc/nvfbc_capture
 server/nvfbc/*.o
+
+# TLS certificates — generated per-host, never committed
+certs/

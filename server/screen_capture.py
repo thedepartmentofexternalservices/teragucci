@@ -17,7 +17,7 @@ import time
 import logging
 import os
 import subprocess
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import mss
 import numpy as np
@@ -139,15 +139,28 @@ def detect_monitors_xrandr() -> List[dict]:
 class ScreenCapture:
     """Captures the Linux screen with enhanced multi-monitor support."""
 
-    def __init__(self, monitor_index: int = 1, jpeg_quality: int = DEFAULT_JPEG_QUALITY):
+    def __init__(self, monitor_index: int = 1,
+                 jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+                 want_10bit: bool = False):
         """
         Args:
             monitor_index: 0 = all monitors (virtual desktop),
                           1+ = specific monitor
             jpeg_quality: JPEG quality for fallback mode
+            want_10bit: Phase 2 VIDEO-09 — request a YUV420P10LE NvFBC
+                surface for the Main10 path. mss has no 10-bit capture
+                so when we fall back to mss the runtime capability state
+                is forced to ``"degraded"`` (the client health overlay
+                renders the explicit badge — no silent downgrade per
+                D-03).
         """
         self.monitor_index = monitor_index
         self.jpeg_quality = jpeg_quality
+        # Phase 2 D-03 / VIDEO-09 state surface — read by the bootstrap
+        # ``build_color_caps()`` helper to override negotiated_state
+        # when the live capture path can't honor the advertised cap.
+        self._want_10bit: bool = bool(want_10bit)
+        self._using_mss_fallback: bool = False
         self._sct = mss.mss()
         self._last_frame: Optional[np.ndarray] = None
         self._xrandr_info: List[dict] = []
@@ -179,6 +192,11 @@ class ScreenCapture:
                     # heavy compositor activity (Flame playback) and
                     # contributed to mid-stream frame layout drift.
                     direct_capture=False,
+                    # Phase 2 VIDEO-09: request 10-bit YUV420P10LE
+                    # surface when caller asked. Helper SDK guard may
+                    # silently fall through to BGRA on older drivers;
+                    # runtime_capability_state surfaces that.
+                    want_10bit=self._want_10bit,
                 )
                 # NvFBC captures the whole screen — override width/height
                 # so downstream encoders see the real framebuffer size
@@ -189,6 +207,16 @@ class ScreenCapture:
                 logger.warning("NvFBC backend unavailable (%s) — "
                                "falling back to mss/XShmGetImage", e)
                 self._nvfbc = None
+                # Phase 2 VIDEO-09 + D-03: mss has no 10-bit path. If
+                # the caller wanted Main10 capture and we fell back to
+                # mss, the negotiated capability state must drop to
+                # "degraded" so the client badge tells the artist
+                # honestly.
+                self._using_mss_fallback = True
+        elif self._want_10bit:
+            # No NvFBC even attempted (no driver / no helper) — also a
+            # degraded path for the 10-bit advertisement.
+            self._using_mss_fallback = True
 
         # Tearing mitigation for the mss fallback path: gate captures
         # on XDamage events so we only read the framebuffer after the
@@ -326,6 +354,11 @@ class ScreenCapture:
         """Select which monitor to capture."""
         monitors = self._sct.monitors
         if index >= len(monitors):
+            logger.warning(
+                "screen_capture.monitor_index_out_of_range requested=%d "
+                "available=%d → primary",
+                index, len(monitors),
+            )
             index = 1  # Fall back to primary
         self.monitor_index = index
         self._monitor = monitors[index]
@@ -392,25 +425,51 @@ class ScreenCapture:
         """
         Check if monitor configuration has changed.
 
+        Phase 3 D-09 — full ``(id, width, height, x, y)`` tuple
+        signature per monitor catches reorder + same-size swap +
+        repositioning that the prior count+WxH-only check missed
+        (Pitfall 4 fix; mirrors D-11 Mac upgrade in
+        ``mac_screen_capture.py::detect_hotplug``).
+
+        Read-only enumeration per D-10 — zero xrandr SET operations.
+        The NVIDIA driver SIGSEGV on HDMI unplug happens specifically
+        during xrandr set-operations (new/add/change mode); enumerate-
+        only stays safe.
+
         Returns True if monitors changed (caller should re-enumerate).
         """
-        old_count = len(self._sct.monitors)
+        try:
+            old_sig = [
+                (m.id, m.width, m.height, m.x, m.y)
+                for m in self.list_monitors()
+            ]
+        except Exception:
+            old_sig = []
         try:
             new_sct = mss.mss()
-            new_count = len(new_sct.monitors)
-            if new_count != old_count:
-                self._sct = new_sct
-                self._refresh_monitor_info()
-                logger.info("Monitor hotplug detected: %d -> %d monitors",
-                           old_count, new_count)
+            # Swap + refresh so list_monitors() reflects the new topology.
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+            self._sct = new_sct
+            self._refresh_monitor_info()
+            # WR-01: Re-select monitor so self._monitor references the NEW
+            # _sct.monitors dict — otherwise capture_raw_bgra() calls
+            # self._sct.grab(self._monitor) with coordinates from the old
+            # topology, which can crash on physical monitor removal.
+            # _select_monitor clamps out-of-range indices back to primary.
+            self._select_monitor(self.monitor_index)
+            new_sig = [
+                (m.id, m.width, m.height, m.x, m.y)
+                for m in self.list_monitors()
+            ]
+            if old_sig != new_sig:
+                logger.info(
+                    "Monitor hotplug detected: %s -> %s",
+                    old_sig, new_sig,
+                )
                 return True
-            # Also check if resolutions changed
-            for i, (old, new) in enumerate(zip(self._sct.monitors, new_sct.monitors)):
-                if old["width"] != new["width"] or old["height"] != new["height"]:
-                    self._sct = new_sct
-                    self._refresh_monitor_info()
-                    logger.info("Monitor %d resolution changed", i)
-                    return True
         except Exception:
             pass
         return False
@@ -422,6 +481,26 @@ class ScreenCapture:
     @property
     def monitor_count(self) -> int:
         return len(self._sct.monitors) - 1  # Subtract virtual desktop
+
+    @property
+    def runtime_capability_state(self) -> str:
+        """Phase 2 VIDEO-09 / D-03: live ServerColorCaps.negotiated_state
+        contribution from the capture path.
+
+        Truth table:
+          want_10bit + NvFBC alive          -> "confirmed"
+          want_10bit + mss fallback / no GPU -> "degraded"
+          NOT want_10bit                    -> "not_supported"
+
+        Consumed by ``server.bootstrap.build_color_caps`` after the
+        live capture is initialized — that helper combines this with
+        the encoder probe to decide the final badge value.
+        """
+        if not self._want_10bit:
+            return "not_supported"
+        if self._using_mss_fallback or self._nvfbc is None:
+            return "degraded"
+        return "confirmed"
 
     # --- Raw BGRA capture (for H.264/H.265/AV1 encoder pipeline) ---
 
@@ -444,10 +523,83 @@ class ScreenCapture:
                 except Exception:
                     pass
                 self._nvfbc = None
+                # Phase 2 VIDEO-09: a mid-stream NvFBC failure on the
+                # 10-bit path drops us to mss → flip to "degraded".
+                if self._want_10bit:
+                    self._using_mss_fallback = True
                 self._init_damage_tracker()
         self._sync_before_capture()
         sct_img = self._sct.grab(self._monitor)
         return bytes(sct_img.raw)
+
+    # Phase 3 D-02 — server-side GPU crop pre-encode.
+    #
+    # mirror_all: crop=None → identical bytes to capture_raw_bgra (Phase 2
+    # 9-checkpoint 10-bit fixture preserved; no new downgrade points).
+    # single / pick_one: crop=(x,y,w,h) feeds a cropped BGRA frame into
+    # the encoder; the encoder's existing BGRA→P010 conversion preserves
+    # 10-bit fidelity through the unchanged Phase 2 pipeline.
+    #
+    # P010 raw-crop seam DEFERRED to Phase 3.5 (v1.1) — the v1 codebase
+    # has no ``capture_raw_p010`` method on any capture backend
+    # (ScreenCapture / MacScreenCapture / NvFBCBackend expose BGRA only).
+    # See docs/release.md "Phase 3.5 follow-ups" for the backlog item.
+    def capture_raw_bgra_with_crop(
+        self, crop: Optional[Tuple[int, int, int, int]] = None,
+    ) -> bytes:
+        """D-02 — full-virtual-desktop capture + optional BGRA crop.
+
+        Args:
+            crop: ``(x, y, w, h)`` in server physical pixels, or None to
+                pass through (mirror_all path).
+
+        Returns:
+            Cropped BGRA bytes. Degenerate crops (w=0 or h=0 after
+            clamping) return a single black pixel ``b"\\x00\\x00\\x00\\xff"``
+            rather than crashing the encoder feed.
+
+        The crop is clamped to the captured frame's bounds (defense
+        against stale crop_rect after a hot-plug), so pick_one + single
+        modes never array-index out-of-bounds on a shrunken virtual
+        desktop.
+        """
+        raw = self.capture_raw_bgra()
+        if crop is None:
+            return raw
+        x, y, w, h = crop
+        # Clamp origin to [0, width/height]; clamp size to remaining area.
+        x = max(0, min(int(x), self.width))
+        y = max(0, min(int(y), self.height))
+        w = max(0, min(int(w), self.width - x))
+        h = max(0, min(int(h), self.height - y))
+        if w == 0 or h == 0:
+            # Single black pixel — defensive fallback per PATTERNS L720-722.
+            # Empty bytes would crash the encoder feed.
+            return b"\x00\x00\x00\xff"
+        # raw may be width*height*4 bytes (mss) OR a padded buffer if the
+        # backend stride doesn't match width*4. The Phase 1 capture path
+        # always produces a tight buffer; still defensive-decode here.
+        expected = self.width * self.height * 4
+        if len(raw) != expected:
+            # Fall back to byte-slice per-row to preserve alignment.
+            row_stride = len(raw) // self.height if self.height > 0 else 0
+            if row_stride < self.width * 4:
+                # Malformed — return black pixel rather than garbage bytes.
+                logger.warning(
+                    "capture_raw_bgra_with_crop: raw size %d != expected %d "
+                    "and row_stride %d < width*4 %d — returning black",
+                    len(raw), expected, row_stride, self.width * 4,
+                )
+                return b"\x00\x00\x00\xff"
+            out = bytearray(w * h * 4)
+            for row in range(h):
+                src_off = (y + row) * row_stride + x * 4
+                out[row * w * 4:(row + 1) * w * 4] = raw[src_off:src_off + w * 4]
+            return bytes(out)
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(
+            self.height, self.width, 4,
+        )
+        return arr[y:y + h, x:x + w].tobytes()
 
     def capture_raw_frame(self) -> np.ndarray:
         """Capture and return as numpy BGRA array."""
@@ -462,6 +614,8 @@ class ScreenCapture:
                 except Exception:
                     pass
                 self._nvfbc = None
+                if self._want_10bit:
+                    self._using_mss_fallback = True
                 self._init_damage_tracker()
         self._sync_before_capture()
         sct_img = self._sct.grab(self._monitor)

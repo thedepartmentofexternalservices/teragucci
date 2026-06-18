@@ -1,0 +1,16 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "pix_fmt": "yuv420p10le",
+  "checkpoints": {
+    "capture":        {"expected_pix_fmt": "p010le", "bottom_2_bits_nonzero_pct": 100.0},
+    "encoder_input":  {"expected_pix_fmt": "p010le", "bottom_2_bits_nonzero_pct": 100.0},
+    "encoder_output": {"ffprobe_pix_fmt": "yuv420p10le", "ffprobe_profile": "Main 10"},
+    "wire":           {"h265_general_profile_idc": 2},
+    "decoder_output": {"av_frame_format_allowed": ["yuv420p10le", "p010le"]},
+    "decoder_hwaccel":{"expected_backend": "videotoolbox", "allow_fallback_pct": 0.0},
+    "qt_surface":     {"texture_format_y": "R16", "texture_format_uv": "RG16"},
+    "final_blit":     {"backbuffer_format": "BGR10A2_UNORM", "sample_assertion": "manual_once"},
+    "display":        {"reference_mode_ok": true, "edr_state": "documented_log_only"}
+  }
+}

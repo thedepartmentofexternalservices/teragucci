@@ -1,6 +1,27 @@
-# Development / testing requirements
+# Development / testing requirements.
+# Includes full runtime deps via -r, plus pytest/ruff/mypy tooling.
 -r requirements-server.txt
 -r requirements-client.txt
 
-pytest>=7.0
-pyinstaller>=6.0
+# Test framework (STAB-01)
+pytest>=8.3,<9
+pytest-asyncio>=0.25,<0.26
+pytest-timeout>=2.3
+pytest-cov
+pytest-xdist
+
+# Lint + typecheck (STAB-03)
+ruff>=0.11,<0.12
+mypy>=1.14,<1.15
+
+# Smoke harness / test utilities
+psutil>=6.0         # cross-platform RSS for STAB-09 D-17 #2
+freezegun           # time-mocking for broker/tokens.py TTL tests
+
+# Build
+pyinstaller>=6.11,<7
+
+# Wacom RMS analysis tooling (Plan 02-12 / D-18 — tools/wacom_quant_analysis.py)
+matplotlib>=3.8
+scipy>=1.14
+numpy>=2.1

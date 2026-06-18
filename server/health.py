@@ -43,6 +43,22 @@ class HealthMonitor:
         self._encode_times: collections.deque = collections.deque(maxlen=120)
         self._capture_times: collections.deque = collections.deque(maxlen=120)
         self._input_latencies: collections.deque = collections.deque(maxlen=120)
+        # OBS-02 (Plan 01-14) — per-stage latency beyond capture/encode. The
+        # client-reported stages (decode, display) will be submitted via the
+        # Phase 4 smoke harness once HealthPong carries them; transmit is
+        # server-side and can be populated today.
+        self._transmit_times: collections.deque = collections.deque(maxlen=120)
+        self._decode_times: collections.deque = collections.deque(maxlen=120)
+        self._display_times: collections.deque = collections.deque(maxlen=120)
+
+        # OBS-03 (Plan 01-14) — keyframe telemetry. keyframe_requested is
+        # incremented by ClientSession.enqueue on the first drop of a streak
+        # (STAB-04 IDR-on-drop path). keyframe_emitted is incremented by
+        # SessionRuntime._on_encoded_frame when the encoder reports
+        # is_keyframe=True. Both counters surface in HealthStats for the
+        # client overlay.
+        self.keyframe_requested = 0
+        self.keyframe_emitted = 0
 
         # Optional reference to the active VideoEncoder so get_stats()
         # can pull the encoder's own rolling average without main.py
@@ -98,6 +114,26 @@ class HealthMonitor:
     def record_input_latency(self, ms: float):
         self._input_latencies.append(ms)
 
+    # OBS-02 — new per-stage recorders (Plan 01-14). Same append-to-deque
+    # pattern as the existing three. Intentionally simple — aggregation lives
+    # in get_stats() via _avg_deque.
+    def record_transmit_time(self, ms: float):
+        self._transmit_times.append(ms)
+
+    def record_decode_time(self, ms: float):
+        self._decode_times.append(ms)
+
+    def record_display_time(self, ms: float):
+        self._display_times.append(ms)
+
+    # OBS-03 — keyframe telemetry counters (Plan 01-14). Plain int bumps; no
+    # locking needed because all call sites run on the main asyncio event loop.
+    def record_keyframe_requested(self):
+        self.keyframe_requested += 1
+
+    def record_keyframe_emitted(self):
+        self.keyframe_emitted += 1
+
     @property
     def avg_rtt_ms(self) -> float:
         if not self._rtt_samples:
@@ -149,9 +185,18 @@ class HealthMonitor:
             bandwidth_mbps=round(self.bandwidth_mbps, 2),
             frames_sent=self._frames_sent,
             frames_dropped=self._frames_dropped,
-            encode_time_ms=round(encode_ms, 2),
-            capture_time_ms=round(self._avg_deque(self._capture_times), 2),
-            input_latency_ms=round(self._avg_deque(self._input_latencies), 2),
+            # Fork: encode_ms is sourced live from the encoder when an
+            # encoder_ref is wired (else falls back to the rolling deque).
+            encode_time_ms=round(encode_ms, 1),
+            capture_time_ms=round(self._avg_deque(self._capture_times), 1),
+            input_latency_ms=round(self._avg_deque(self._input_latencies), 1),
+            # OBS-02 — Plan 01-14
+            transmit_time_ms=round(self._avg_deque(self._transmit_times), 1),
+            decode_time_ms=round(self._avg_deque(self._decode_times), 1),
+            display_time_ms=round(self._avg_deque(self._display_times), 1),
+            # OBS-03 — Plan 01-14
+            keyframe_requested=self.keyframe_requested,
+            keyframe_emitted=self.keyframe_emitted,
             codec=self.current_codec,
             chroma=self.current_chroma,
             resolution=self.current_resolution,

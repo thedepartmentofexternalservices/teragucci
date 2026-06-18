@@ -1,0 +1,136 @@
+# STAB-09 / D-15..D-18 — nightly 1-hour synthetic smoke harness.
+#
+# D-16 policy:
+#   One job each on macos-14 and rockylinux:9. A persistent failure across
+#   3 consecutive nights pauses the next release tag. In Phase 1 this is
+#   enforced manually via release discipline + the auto-created failure
+#   issue below; Phase 7 may formalize it as a branch-protection rule.
+#
+# D-18 policy:
+#   Phase 1 ships the 1-hour version (SMOKE_DURATION_S=3600). Phase 4 will
+#   raise this to 8 hours once the audio path is wired and the audio
+#   dropout assertion has real signal to measure.
+#
+# Failure handling:
+#   * diagnostic bundle via common/diagnostic_bundle.py on the Linux job
+#     (builds a scrubbed zip via the OBS-05 format from Plan 01-15)
+#   * smoke log tail uploaded as an artifact (30 day retention)
+#   * a GitHub issue is auto-opened on failure for triage
+name: Nightly smoke (D-16)
+
+on:
+  schedule:
+    # 08:00 UTC daily. PT: 00:00 PST / 01:00 PDT — overnight for the
+    # maintainer's timezone. UTC 07 would also work; 08 leaves slack
+    # for upstream GHA scheduling jitter without slipping into work hours.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+# Don't run concurrent nightly runs — a single green result per night
+# per runner is the D-16 signal; extras just churn.
+concurrency:
+  group: smoke-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke-linux:
+    name: 1-hour smoke (Rocky 9 / x86_64)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OS deps
+        # Matches ci.yml test-linux — EPEL for python3.12, ffmpeg-free for
+        # any encoder-adjacent imports (we mock at subprocess boundary so
+        # real ffmpeg never runs).
+        run: |
+          dnf -y install epel-release
+          dnf -y install python3.12 python3.12-devel python3.12-pip gcc git \
+                         ffmpeg-free xclip pulseaudio-utils
+
+      - name: Install Python deps
+        run: |
+          python3.12 -m pip install --upgrade pip
+          python3.12 -m pip install -r requirements-dev.txt
+
+      - name: Run 1-hour smoke (SMOKE_DURATION_S=3600)
+        env:
+          SMOKE_DURATION_S: "3600"
+        run: |
+          mkdir -p /tmp/smoke
+          python3.12 -m pytest tests/smoke/test_synthetic_1h.py -v \
+              -m smoke_1h --timeout=4000 -s 2>&1 | tee /tmp/smoke/smoke-linux.log
+
+      - name: On failure — build diagnostic bundle (OBS-05)
+        if: failure()
+        run: |
+          python3.12 - <<'PY' || true
+          from common.diagnostic_bundle import build_bundle
+          path = build_bundle("/tmp/smoke/smoke-failure-diag.zip", tier="server")
+          print(f"[smoke] diagnostic bundle: {path}")
+          PY
+
+      - name: On failure — upload diagnostics + log tail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux-diag
+          path: |
+            /tmp/smoke/smoke-linux.log
+            /tmp/smoke/smoke-failure-diag.zip
+          retention-days: 30
+
+      - name: On failure — open GitHub issue (D-16 triage)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Nightly smoke failed on Rocky 9 ($(date -u +%Y-%m-%d))"
+          BODY="Nightly smoke harness failed. See workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue create --title "$TITLE" --body "$BODY" --label "smoke-nightly-failure" || true
+
+  smoke-macos:
+    name: 1-hour smoke (macOS 14 / arm64)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          brew install ffmpeg@7 || brew install ffmpeg
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+
+      - name: Run 1-hour smoke (SMOKE_DURATION_S=3600)
+        env:
+          SMOKE_DURATION_S: "3600"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          mkdir -p /tmp/smoke
+          python3 -m pytest tests/smoke/test_synthetic_1h.py -v \
+              -m smoke_1h --timeout=4000 -s 2>&1 | tee /tmp/smoke/smoke-macos.log
+
+      - name: On failure — upload log tail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-macos-diag
+          path: /tmp/smoke/smoke-macos.log
+          retention-days: 30
+
+      - name: On failure — open GitHub issue (D-16 triage)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Nightly smoke failed on macOS 14 ($(date -u +%Y-%m-%d))"
+          BODY="Nightly smoke harness failed. See workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue create --title "$TITLE" --body "$BODY" --label "smoke-nightly-failure" || true

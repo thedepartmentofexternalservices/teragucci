@@ -33,6 +33,7 @@ from broker.freeipa import FreeIPAClient
 from broker.pool import MachinePool
 from broker.tokens import generate_token
 from broker.admin import AdminServer
+from common.logging import configure as _configure_logging
 
 logger = logging.getLogger("teraguchi.broker")
 
@@ -296,12 +297,10 @@ def main():
 
     args = parser.parse_args()
 
-    # Logging
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    # OBS-01: route all logging (stdlib + structlog) through the canonical
+    # processor chain. phase="broker" is bound into contextvars so every
+    # emit carries it (CONTEXT.md §"Claude's Discretion" line 83).
+    _configure_logging(phase="broker", verbose=args.verbose)
 
     global pool, ipa, admin_server, signing_secret, required_group, admin_group, config_path
 

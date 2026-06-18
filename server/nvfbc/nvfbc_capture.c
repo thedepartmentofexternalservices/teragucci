@@ -128,10 +128,11 @@ static void cleanup(void) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s [--display :N] [--fps N] [--with-cursor 0|1] [--push 0|1] "
-        "[--direct-capture 0|1]\n"
+        "[--direct-capture 0|1] [--want-10bit 0|1]\n"
         "\n"
-        "Streams raw BGRA frames captured via NvFBC to stdout.\n"
-        "See source for wire format.\n", prog);
+        "Streams raw BGRA (8-bit) or YUV420P10LE (Phase 2 VIDEO-09 10-bit)\n"
+        "frames captured via NvFBC to stdout. See source for wire format.\n",
+        prog);
 }
 
 int main(int argc, char **argv) {
@@ -141,6 +142,14 @@ int main(int argc, char **argv) {
     int         push_model      = 1;
     int         direct_capture  = 0;      /* opt-in: known to be unstable */
     int         grab_timeout_ms = 1000;
+    /* Phase 2 VIDEO-09 (10-bit Linux capture). When true AND the
+     * installed NvFBC SDK exposes NVFBC_BUFFER_FORMAT_YUV420P10LE,
+     * the capture session is set up to deliver 10-bit YUV instead of
+     * 8-bit BGRA. The Python side requests this when ServerColorCaps
+     * negotiates main10. SDK older than ~12.x without the enum value
+     * silently degrades to BGRA + emits a warning to stderr (caught
+     * by the parent, surfaces as the 'degraded' badge). */
+    int         want_10bit      = 0;
 
     static const struct option opts[] = {
         {"display",        required_argument, 0, 'd'},
@@ -148,18 +157,20 @@ int main(int argc, char **argv) {
         {"with-cursor",    required_argument, 0, 'c'},
         {"push",           required_argument, 0, 'p'},
         {"direct-capture", required_argument, 0, 'D'},
+        {"want-10bit",     required_argument, 0, 't'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:f:c:p:D:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:f:c:p:D:t:h", opts, NULL)) != -1) {
         switch (opt) {
             case 'd': display        = optarg; break;
             case 'f': fps            = atoi(optarg); break;
             case 'c': with_cursor    = atoi(optarg); break;
             case 'p': push_model     = atoi(optarg); break;
             case 'D': direct_capture = atoi(optarg); break;
+            case 't': want_10bit     = atoi(optarg); break;
             case 'h': usage(argv[0]); return 0;
             default:  usage(argv[0]); return 2;
         }
@@ -291,15 +302,37 @@ int main(int argc, char **argv) {
     }
     g_session_alive = 1;
 
-    /* Set up the capture: NvFBC allocates a BGRA system-memory buffer
-     * and writes its address into pBuffer. It owns the buffer — we
-     * just read from it. It re-allocates automatically on resolution
-     * change. */
+    /* Set up the capture: NvFBC allocates a system-memory buffer (BGRA
+     * by default; YUV420P10LE on the Phase 2 VIDEO-09 10-bit path) and
+     * writes its address into pBuffer. It owns the buffer — we just
+     * read from it. It re-allocates automatically on resolution change.
+     *
+     * Phase 2 VIDEO-09: 10-bit surface format selection. NVFBC_BUFFER_
+     * FORMAT_YUV420P10LE has been in the NvFBC SDK since ~12.x; older
+     * SDKs (and older driver bundles that ship an older NvFBC.h) don't
+     * expose the enum value. Compile-out the 10-bit path when the SDK
+     * is too old so the helper still builds against the older header
+     * and degrades to BGRA at run time (the Python parent catches the
+     * warning on stderr and flips the ServerColorCaps badge to
+     * 'degraded'). */
     void *pBuffer = NULL;
     NVFBC_TOSYS_SETUP_PARAMS ss;
     memset(&ss, 0, sizeof(ss));
     ss.dwVersion     = NVFBC_TOSYS_SETUP_PARAMS_VER;
+#ifdef NVFBC_BUFFER_FORMAT_YUV420P10LE
+    if (want_10bit) {
+        ss.eBufferFormat = NVFBC_BUFFER_FORMAT_YUV420P10LE;
+        log_line("using 10-bit YUV420P10LE surface (VIDEO-09 main10 path)");
+    } else {
+        ss.eBufferFormat = NVFBC_BUFFER_FORMAT_BGRA;
+    }
+#else
+    if (want_10bit) {
+        log_line("SDK too old for NVFBC_BUFFER_FORMAT_YUV420P10LE; "
+                 "falling through to BGRA (capability badge will be 'degraded')");
+    }
     ss.eBufferFormat = NVFBC_BUFFER_FORMAT_BGRA;
+#endif
     ss.ppBuffer      = &pBuffer;
     ss.bWithDiffMap  = NVFBC_FALSE;
     ss.ppDiffMap     = NULL;
@@ -313,8 +346,8 @@ int main(int argc, char **argv) {
     }
 
     log_line("capture loop starting (fps=%d cursor=%d push=%d direct=%d "
-             "locked=%ux%u)",
-             fps, with_cursor, push_model, direct_capture,
+             "want_10bit=%d locked=%ux%u)",
+             fps, with_cursor, push_model, direct_capture, want_10bit,
              gs.screenSize.w, gs.screenSize.h);
 
     /* Main capture loop. With push model + blocking grab, NvFBC

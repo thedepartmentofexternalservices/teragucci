@@ -70,6 +70,10 @@ class MachinePool:
             self._machines[m.name] = m
         self._probe_task: Optional[asyncio.Task] = None
 
+        # SEC-01 dev escape hatch. Double-gated with TERAGUCHI_ACCEPT_INSECURE=1.
+        self._insecure_skip_verify: bool = False
+        self._ca_bundle: Optional[str] = None
+
         # Build assignment lookups
         self._user_machines: dict[str, set[str]] = {}   # user → allowed machine names
         self._machine_users: dict[str, set[str]] = {}   # machine → assigned users
@@ -148,9 +152,15 @@ class MachinePool:
     async def _probe_one(self, machine: Machine):
         """Probe a single machine's /status endpoint."""
         url = f"https://{machine.host}:{machine.port}/status"
+        from common.tls_opt_out import build_client_ssl_context
+        ssl_ctx = build_client_ssl_context(
+            insecure_cli_flag=getattr(self, "_insecure_skip_verify", False),
+            ca_bundle=getattr(self, "_ca_bundle", None),
+            site_label="broker_probe",
+        )
         try:
             async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
+                connector=aiohttp.TCPConnector(ssl=ssl_ctx)
             ) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:

@@ -1,0 +1,127 @@
+name: CI
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-typecheck:
+    name: Lint + typecheck (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-lint-${{ hashFiles('requirements-*.txt') }}
+      - name: Install deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+      - name: ruff check
+        run: python3 -m ruff check .
+      - name: ruff format --check
+        run: python3 -m ruff format --check .
+      - name: mypy
+        run: python3 -m mypy
+
+  test-linux:
+    name: Tests (Rocky 9 + Python 3.12)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OS deps
+        # RESEARCH Pitfall 5: Rocky 9's default python3 is 3.9. EPEL is required
+        # for python3.12. ffmpeg-free covers the D-02 mocked-at-subprocess boundary
+        # (we never actually encode on the runner).
+        run: |
+          dnf -y install epel-release
+          dnf -y install python3.12 python3.12-devel python3.12-pip gcc git \
+                         ffmpeg-free xclip pulseaudio-utils
+      - name: Install Python deps
+        run: |
+          python3.12 -m pip install --upgrade pip
+          python3.12 -m pip install -r requirements-dev.txt
+      - name: Pytest
+        # --timeout=60 overrides pyproject.toml's 30s default for the linux suite
+        # which includes integration tests. `-m "not latency_bench"` excludes the
+        # D-08 synthetic-stage benchmark (Plan 01-16) — that runs in the dedicated
+        # `latency-bench` job so PR turnaround doesn't pay its ~25 s cost.
+        # `-m "not smoke_1h"` excludes the STAB-09 1-hour smoke harness
+        # (Plan 01-17) — that runs only in the nightly `smoke-nightly.yml` cron.
+        # `-m "not wacom_hw"` excludes Phase 2 (02-01) real-Wacom tests — those
+        # are gated in the per-release manual ritual per D-16, never in GHA.
+        # `-m "not gpu"` excludes Phase 2 GPU-required 10-bit checkpoints 7-9
+        # (D-01 cp.8 manual-verified-once + cp.9 display state).
+        run: python3.12 -m pytest -v --timeout=60 -m "not latency_bench and not smoke_1h and not wacom_hw and not gpu"
+
+  test-macos:
+    name: Tests (macOS 14 / Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-macos-${{ hashFiles('requirements-*.txt') }}
+      - name: Install ffmpeg (for decoder tests)
+        run: brew install ffmpeg@7 || brew install ffmpeg
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+      - name: Verify shaders are up-to-date with sources
+        # Phase 2 D-02 / T-02-19 mitigation: regenerate the .qsb binaries
+        # from their GLSL sources and fail if anything drifts. Cheap drift
+        # guard against shader-source / committed-binary divergence.
+        run: |
+          ./scripts/build_shaders.sh
+          git diff --exit-code client/shaders/
+      - name: Pytest
+        # Offscreen Qt for macOS so client tests don't require a display.
+        # `-m "not latency_bench"` excludes the D-08 synthetic-stage benchmark
+        # (Plan 01-16) — that runs in the dedicated `latency-bench` job on
+        # Rocky 9 only. `-m "not smoke_1h"` excludes the STAB-09 1-hour smoke
+        # harness (Plan 01-17) — that runs only in `smoke-nightly.yml`.
+        # `-m "not wacom_hw"` + `not gpu` — see test-linux job rationale
+        # (Phase 2 02-01 Task 3; D-16 + D-01 cp.8-9).
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 -m pytest -v --timeout=60 -m "not latency_bench and not smoke_1h and not wacom_hw and not gpu"
+
+  # Synthetic harness-math gate per D-09. Real-hardware latency is measured
+  # manually on DXS workstations pre-release.
+  latency-bench:
+    name: Latency benchmark (synthetic p99 < 25 ms)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    needs: test-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OS deps
+        run: |
+          dnf -y install epel-release
+          dnf -y install python3.12 python3.12-pip gcc
+      - name: Install Python deps
+        run: |
+          python3.12 -m pip install --upgrade pip
+          python3.12 -m pip install -r requirements-dev.txt
+      - name: Run latency benchmark
+        # D-09: synthetic-stage-time accumulator; D-08: p99 < 25 ms gate.
+        # This is NOT real-hardware timing — it validates the harness math
+        # and asyncio scheduling budget only.
+        run: python3.12 -m pytest tests/smoke/test_latency_benchmark.py -v -m latency_bench --timeout=120

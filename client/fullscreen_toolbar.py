@@ -10,10 +10,10 @@ import logging
 from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QPoint, QEasingCurve, Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QFont
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QGraphicsDropShadowEffect, QApplication,
+    QWidget, QHBoxLayout, QLabel, QPushButton,
+    QGraphicsDropShadowEffect, QFrame,
 )
 
 from client import theme
@@ -23,6 +23,115 @@ logger = logging.getLogger(__name__)
 TOOLBAR_HEIGHT = 48
 REVEAL_ZONE = 3          # pixels from top edge to trigger reveal
 HIDE_DELAY_MS = 1200     # ms after mouse leaves before hiding
+
+
+# ════════════════════════════════════════════════════
+# Phase 3 D-01 / UI-SPEC Surface 2 — Mode badge
+# ════════════════════════════════════════════════════
+
+
+class _ModeBadge(QFrame):
+    """Read-only mode badge per UI-SPEC Surface 2.
+
+    Renders one of:
+      * ``Mode: single``
+      * ``Mode: mirror``
+      * ``Mode: pick: {name}``
+      * ``Mode: pick → primary``   (degraded; WARNING-colored underline)
+
+    Tooltip locked verbatim:
+      * normal:   "Monitor mode is fixed for this session. Disconnect
+                   and reconnect to change."
+      * degraded: "{monitor_name} disappeared. Showing primary monitor
+                   instead."
+
+    2 px accent underline painted under the label (ACCENT when active,
+    WARNING when degraded). GOLD dot left of the label signals
+    "locked informational state" per UI-SPEC color row (distinct from
+    selectable-ACCENT). The badge is visible only while a session
+    advertises a live mode — clearing via ``update("")`` hides it.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mode = ""
+        self._picked_name = ""
+        self._degraded = False
+
+        self._label = QLabel("")
+        self._label.setStyleSheet(
+            f"font-size: 13px; font-weight: 600; color: {theme.TEXT_PRIMARY};"
+        )
+        self._dot = QLabel("●")
+        self._dot.setStyleSheet(
+            f"color: {theme.GOLD}; font-size: 10px;"
+        )
+        self._dot.setToolTip(
+            "Monitor mode is locked for the active session."
+        )
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 0, 8, 0)   # sm token
+        h.setSpacing(4)                    # xs token
+        h.addWidget(self._dot)
+        h.addWidget(self._label)
+
+        self.setVisible(False)  # only visible during an active session
+        self.setToolTip(
+            "Monitor mode is fixed for this session. "
+            "Disconnect and reconnect to change."
+        )
+
+    def update_state(self, mode: str, picked_name: str = "",
+                     degraded: bool = False) -> None:
+        """Update badge text + tooltip + underline per mode/degraded.
+
+        Named ``update_state`` (not ``update``) to avoid shadowing the
+        QWidget.update() repaint method — we still call super().update()
+        below to trigger a paintEvent for the underline.
+        """
+        self._mode = mode
+        self._picked_name = picked_name
+        self._degraded = degraded
+
+        if not mode:
+            self.setVisible(False)
+            return
+
+        locked_tip = (
+            "Monitor mode is fixed for this session. "
+            "Disconnect and reconnect to change."
+        )
+
+        if degraded and mode == "pick_one":
+            text = "Mode: pick → primary"
+            self.setToolTip(
+                f"{picked_name} disappeared. Showing primary monitor instead."
+            )
+        elif mode == "pick_one":
+            text = f"Mode: pick: {picked_name}"
+            self.setToolTip(locked_tip)
+        elif mode == "mirror_all":
+            text = "Mode: mirror"
+            self.setToolTip(locked_tip)
+        else:
+            text = "Mode: single"
+            self.setToolTip(locked_tip)
+
+        self._label.setText(text)
+        self.setVisible(True)
+        self.update()  # repaint underline
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        # 2 px underline beneath the label per UI-SPEC Surface 2
+        p = QPainter(self)
+        color_str = theme.WARNING if self._degraded else theme.ACCENT
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color_str))
+        r = self._label.geometry()
+        p.drawRect(r.left(), self.height() - 2, r.width(), 2)
+        p.end()
 
 
 class FullscreenToolbar(QWidget):
@@ -86,6 +195,23 @@ class FullscreenToolbar(QWidget):
         self._monitor_selector.setMinimumWidth(120)
         self._monitor_selector.setMaximumWidth(200)
         layout.addWidget(self._monitor_selector)
+
+        # Phase 3 D-15 / UI-SPEC Surface 7 / Plan 03-07 — clipboard direction
+        # toggle button (4-checkbox nested menu). Inserts between the
+        # MonitorSelector and the mode badge so the clipboard and monitor
+        # affordances sit side-by-side in the left half of the toolbar.
+        from client.clipboard_toggle_menu import ClipboardToggleButton
+        self._clipboard_toggle = ClipboardToggleButton()
+        layout.addSpacing(8)   # sm token
+        layout.addWidget(self._clipboard_toggle)
+
+        # Phase 3 D-01 / UI-SPEC Surface 2 — read-only mode badge.
+        # Inserts between monitor selector and the addStretch so the
+        # badge stays in the left half of the toolbar near the other
+        # session-state affordances.
+        self._mode_badge = _ModeBadge()
+        layout.addSpacing(8)   # sm token separation from MonitorSelector
+        layout.addWidget(self._mode_badge)
 
         layout.addStretch()
 
@@ -188,6 +314,24 @@ class FullscreenToolbar(QWidget):
     def update_monitors(self, monitors: list):
         self._monitor_selector.update_monitors(monitors)
 
+    def update_capture_mode(self, mode: str, picked_name: str = "",
+                            degraded: bool = False) -> None:
+        """Phase 3 D-01 — toolbar slot for session capture-mode state.
+
+        Session calls this on connect / disconnect / degraded-fallback
+        events. Empty ``mode`` hides the badge (used on disconnect).
+        """
+        self._mode_badge.update_state(mode, picked_name, degraded)
+
     @property
     def monitor_selector(self):
         return self._monitor_selector
+
+    @property
+    def mode_badge(self):
+        return self._mode_badge
+
+    @property
+    def clipboard_toggle(self):
+        """Phase 3 D-15 / UI-SPEC Surface 7 — clipboard direction button."""
+        return self._clipboard_toggle

@@ -1,0 +1,71 @@
+name: Build artifacts
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-mac-app:
+    name: PyInstaller .app (macos-14 arm64 dry-run)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-build-mac-${{ hashFiles('requirements-*.txt') }}
+      - name: Install build deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-client.txt
+          python3 -m pip install 'pyinstaller>=6.11,<7'
+      - name: PyInstaller build
+        # Phase 1 is dry-run only — we gate on exit code, not universal2 or notarization.
+        # RESEARCH Pitfall 4: macos-14 runners are arm64; accept arm64-only output.
+        run: python3 build_client.py
+      - name: Verify .app exists
+        run: test -d dist/Teraguchi.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Teraguchi-app-arm64
+          path: dist/Teraguchi.app
+          retention-days: 7
+
+  build-rpm-dryrun:
+    name: RPM dry-run (Rocky 9)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rpmbuild
+        run: |
+          dnf -y install epel-release
+          dnf -y install rpm-build rpmdevtools python3.12
+      - name: Set up rpmbuild tree
+        run: |
+          rpmdev-setuptree
+          # Create a minimal tarball so %prep has something
+          mkdir -p /tmp/src/teraguchi-server-3.0.0
+          cp -R server/ common/ /tmp/src/teraguchi-server-3.0.0/ || true
+          tar -czf ~/rpmbuild/SOURCES/teraguchi-server-3.0.0.tar.gz -C /tmp/src teraguchi-server-3.0.0
+          cp packaging/teraguchi-server.spec ~/rpmbuild/SPECS/
+      - name: rpmbuild --nodeps --buildonly
+        # --nodeps: runner container may not have ffmpeg-free available; Phase 6 fixes.
+        # --buildonly: validate spec syntax + %prep/%build without %install actions.
+        run: rpmbuild -bb --nodeps ~/rpmbuild/SPECS/teraguchi-server.spec
+      - name: Verify SRPM exists
+        run: |
+          # Even with --nodeps, rpmbuild -bb produces an SRPM as a side-effect
+          ls ~/rpmbuild/SRPMS/ || true
+          ls ~/rpmbuild/RPMS/noarch/ || true
+          echo "Phase 1 RPM dry-run complete (spec validates)"

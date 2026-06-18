@@ -26,3 +26,15 @@ cryptography>=41.0
 # - NVIDIA: nvidia-driver with NVENC support (GTX 600+ / Quadro K series+)
 # - Intel:  intel-media-va-driver or intel-media-va-driver-non-free (VAAPI)
 # - AMD:    mesa-va-drivers (VAAPI) or amdgpu-pro (AMF)
+
+# Phase 1 runtime additions (STAB-06 FSM library, OBS-01 structured logging)
+python-statemachine>=2.6,<3
+structlog>=25.1,<26
+
+# Phase 2 / D-04 / VIDEO-04 — direct VTCompressionSession on macOS server.
+# Replaces the FFmpeg hevc_videotoolbox subprocess hop (5-8ms/frame savings
+# per WWDC21 session 10158). PyObjC frameworks are macOS-only so the markers
+# keep Linux installs slim.
+pyobjc-framework-VideoToolbox>=11.0 ; sys_platform == "darwin"
+pyobjc-framework-CoreVideo>=11.0 ; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=11.0 ; sys_platform == "darwin"

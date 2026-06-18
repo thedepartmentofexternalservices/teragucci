@@ -13,6 +13,7 @@ into the Linux input subsystem, which X11/Wayland will pick up.
 import logging
 import struct
 import os
+import subprocess
 import time
 from typing import Optional
 
@@ -436,6 +437,20 @@ class InputInjector:
     Unified input injector that manages all virtual devices.
     """
 
+    # Phase 2 D-11 — Linux scan codes for the modifier keys we care about
+    # for "release everything held". Mirrors XTestInputInjector's modifier
+    # list at the keysym → scan-code level so the two paths are consistent.
+    _MODIFIER_SCAN_CODES = (
+        42,   # KEY_LEFTSHIFT
+        54,   # KEY_RIGHTSHIFT
+        29,   # KEY_LEFTCTRL
+        97,   # KEY_RIGHTCTRL
+        56,   # KEY_LEFTALT
+        100,  # KEY_RIGHTALT (AltGr)
+        125,  # KEY_LEFTMETA (Super_L / Cmd-mapped)
+        126,  # KEY_RIGHTMETA
+    )
+
     def __init__(self, screen_width: int = 1920, screen_height: int = 1080):
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -443,6 +458,55 @@ class InputInjector:
         self.keyboard = VirtualKeyboard()
         self.pen = VirtualPenTablet(screen_width, screen_height)
         logger.info("Input injector ready (all virtual devices created)")
+
+    def reset_modifiers(self) -> None:
+        """Phase 2 D-11 — release every modifier key the wire can hold.
+
+        Idempotent. Called on:
+          1. Client focusOutEvent
+          2. Reconnect (post-auth)
+          3. Server periodic safety net (~10s no events + no chord)
+          4. Client F9 panic shortcut
+
+        Implemented at the uinput layer so it bypasses any X-state
+        confusion. The XTest-backed injector has its own equivalent that
+        operates at the X11 keysym level — both paths funnel into the
+        same idempotent contract.
+        """
+        for code in self._MODIFIER_SCAN_CODES:
+            try:
+                self.keyboard.key_event(code, False)
+            except Exception as e:
+                # Best-effort: a stale modifier release should not crash
+                # the input dispatcher. Log + continue.
+                logger.debug("reset_modifiers: release %d failed: %s", code, e)
+        logger.info("input.reset_modifiers (uinput)")
+
+    def text_commit(self, text: str) -> None:
+        """Phase 2 D-15 — IME / dead-key commit string passthrough.
+
+        Shells out to ``xdotool type --clearmodifiers --delay 0`` so the
+        target X application receives the literal Unicode text without
+        synthesizing keycodes (which would mangle dead-key composition).
+
+        Failure modes (xdotool missing, X server unreachable, etc.) are
+        logged at debug and swallowed — text-commit is best-effort.
+        """
+        if not text:
+            return
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", text],
+                check=False, timeout=2,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "text_commit: xdotool not installed — IME passthrough disabled"
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("text_commit: xdotool timed out (text=%d chars)", len(text))
+        except Exception as e:
+            logger.debug("text_commit: xdotool failed: %s", e)
 
     def handle_message(self, msg: dict):
         """Dispatch a parsed input message to the appropriate device."""

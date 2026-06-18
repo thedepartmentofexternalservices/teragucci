@@ -10,3 +10,7 @@ numpy>=1.24  # Required by PyAV frame.to_ndarray() — client is black without i
 
 # QUIC transport (optional, recommended)
 aioquic>=1.0
+
+# Phase 1 runtime additions (STAB-06 FSM library, OBS-01 structured logging)
+python-statemachine>=2.6,<3
+structlog>=25.1,<26
