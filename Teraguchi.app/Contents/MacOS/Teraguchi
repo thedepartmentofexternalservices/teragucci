@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="/Users/randymcentee/workspace/GitHub/teraguchi"
+source "$SCRIPT_DIR/.venv/bin/activate"
+cd "$SCRIPT_DIR"
+exec python -m client.main "$@"
