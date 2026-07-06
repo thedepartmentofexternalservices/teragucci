@@ -78,6 +78,7 @@ class NvFBCBackend:
                  push_model: bool = True,
                  direct_capture: bool = False,
                  want_10bit: bool = False,
+                 want_nv12: bool = False,
                  startup_timeout: float = 5.0):
         """Spawn the nvfbc_capture helper.
 
@@ -114,6 +115,9 @@ class NvFBCBackend:
             "--push", "1" if push_model else "0",
             "--direct-capture", "1" if direct_capture else "0",
             "--want-10bit", "1" if want_10bit else "0",
+            # Task #20: NV12 surface (1.5 B/px vs BGRA 4 B/px) for 4:2:0
+            # encodes — GPU-side RGB->YUV, 2.7x less pipe traffic at 4K.
+            "--want-nv12", "1" if (want_nv12 and not want_10bit) else "0",
         ]
         if display:
             args.extend(["--display", display])
@@ -121,6 +125,7 @@ class NvFBCBackend:
         # surface format we asked for (the runtime SDK guard may have
         # overridden it back to BGRA, which is reported via stderr).
         self._want_10bit = bool(want_10bit)
+        self._want_nv12 = bool(want_nv12 and not want_10bit)
 
         env = os.environ.copy()
         if display:

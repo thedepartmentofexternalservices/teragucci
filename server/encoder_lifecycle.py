@@ -74,7 +74,8 @@ class EncoderLifecycle:
                     enc_list[c] = [e for e in encs if e.backend == "software"]
             self.encoder = VideoEncoder(
                 runtime.capture.width, runtime.capture.height,
-                runtime.quality, available_encoders=enc_list)
+                runtime.quality, available_encoders=enc_list,
+                input_pix_fmt=getattr(runtime.capture, "output_format", "bgra"))
             self.encoder.start(runtime._on_encoded_frame)
             # Publish the handle — ClientSession.enqueue (STAB-04) reaches
             # it via ``self.runtime.encoder``; tests/server/test_pipelines.py
@@ -104,7 +105,8 @@ class EncoderLifecycle:
             old_available = None
         self.encoder = VideoEncoder(
             runtime.capture.width, runtime.capture.height,
-            runtime.quality, available_encoders=old_available)
+            runtime.quality, available_encoders=old_available,
+            input_pix_fmt=getattr(runtime.capture, "output_format", "bgra"))
         self.encoder.start(runtime._on_encoded_frame)
         runtime.encoder = self.encoder   # keep the back-compat handle fresh
         runtime.health.current_resolution = (

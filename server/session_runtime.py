@@ -52,6 +52,7 @@ from common.messages import (
     ClipboardMsg,
     FrameType,
     MsgType,
+    ChromaSubsampling,
     QualitySettings,
     VideoCodec,
     VideoFrameFlags,
@@ -158,8 +159,21 @@ class SessionRuntime:
         os.environ["DISPLAY"] = display
 
         try:
-            self.capture = ScreenCapture(monitor_index=monitor_index,
-                                         jpeg_quality=jpeg_quality)
+            # Task #20: for 4:2:0 H.264/HEVC sessions ask NvFBC for an NV12
+            # surface — GPU-side RGB->YUV, 2.7x less pipe traffic at 4K.
+            # 4:4:4 / 4:2:2 / JPEG paths keep BGRA (they need full chroma).
+            _want_nv12 = (
+                quality.codec.lower() in ("h264", "h265", "av1")
+                and quality.effective_chroma() == ChromaSubsampling.YUV420
+            )
+            try:
+                self.capture = ScreenCapture(monitor_index=monitor_index,
+                                             jpeg_quality=jpeg_quality,
+                                             want_nv12=_want_nv12)
+            except TypeError:
+                # macOS / test-stub capture classes without the kwarg.
+                self.capture = ScreenCapture(monitor_index=monitor_index,
+                                             jpeg_quality=jpeg_quality)
             if IS_MACOS:
                 # On macOS there's no Xvfb / uinput — CoreGraphics posts
                 # events directly into the logged-in user's event stream.
@@ -519,10 +533,27 @@ class SessionRuntime:
         header = encode_video_header(frame_type, codec, chroma, flags, timestamp)
         tcp_data = header + frame_data
 
+        # Task #14 — per-client transport split: once a client has confirmed
+        # the UDP probe, its video goes out as UDP datagrams (no WS queue, no
+        # TCP head-of-line blocking); everyone else stays on the WebSocket.
+        # UDP frames carry NO 10-byte header — the fragmenter's own header
+        # carries channel/flags/timestamp and the client reassembler
+        # re-synthesizes the metadata.
+        hybrid = getattr(self, "hybrid_transport", None)
+        udp = getattr(self, "udp_server", None)
+
         for ws, cs in list(self.clients.items()):
-            if cs.authenticated and self._event_loop:
-                asyncio.run_coroutine_threadsafe(
-                    self._enqueue_frame(cs, tcp_data, is_keyframe), self._event_loop)
+            if not (cs.authenticated and self._event_loop):
+                continue
+            if (hybrid is not None and udp is not None
+                    and hybrid.should_use_udp(cs.client_id)):
+                # Sync + lock-protected; called straight from the encoder
+                # thread. Falls back to the WS path if the send fails.
+                if udp.send_video_frame_to(cs.client_id, frame_data,
+                                           timestamp, is_keyframe):
+                    continue
+            asyncio.run_coroutine_threadsafe(
+                self._enqueue_frame(cs, tcp_data, is_keyframe), self._event_loop)
 
         self.health.record_frame_sent(len(frame_data))
 

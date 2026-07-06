@@ -150,6 +150,10 @@ int main(int argc, char **argv) {
      * silently degrades to BGRA + emits a warning to stderr (caught
      * by the parent, surfaces as the 'degraded' badge). */
     int         want_10bit      = 0;
+    /* Task #20 — 4K@60 path. NV12 = 1.5 B/px vs BGRA 4 B/px: a 4K frame
+     * drops 33 MB -> 12.4 MB across BOTH pipe hops, and RGB->YUV happens
+     * on the GPU (NvFBC) instead of ffmpeg swscale. 4:2:0 encodes only. */
+    int         want_nv12       = 0;
 
     static const struct option opts[] = {
         {"display",        required_argument, 0, 'd'},
@@ -158,12 +162,13 @@ int main(int argc, char **argv) {
         {"push",           required_argument, 0, 'p'},
         {"direct-capture", required_argument, 0, 'D'},
         {"want-10bit",     required_argument, 0, 't'},
+        {"want-nv12",      required_argument, 0, 'n'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:f:c:p:D:t:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:f:c:p:D:t:n:h", opts, NULL)) != -1) {
         switch (opt) {
             case 'd': display        = optarg; break;
             case 'f': fps            = atoi(optarg); break;
@@ -171,6 +176,7 @@ int main(int argc, char **argv) {
             case 'p': push_model     = atoi(optarg); break;
             case 'D': direct_capture = atoi(optarg); break;
             case 't': want_10bit     = atoi(optarg); break;
+            case 'n': want_nv12      = atoi(optarg); break;
             case 'h': usage(argv[0]); return 0;
             default:  usage(argv[0]); return 2;
         }
@@ -323,6 +329,9 @@ int main(int argc, char **argv) {
     if (want_10bit) {
         ss.eBufferFormat = NVFBC_BUFFER_FORMAT_YUV420P10LE;
         log_line("using 10-bit YUV420P10LE surface (VIDEO-09 main10 path)");
+    } else if (want_nv12) {
+        ss.eBufferFormat = NVFBC_BUFFER_FORMAT_NV12;
+        log_line("using NV12 surface (task #20 4:2:0 low-bandwidth path)");
     } else {
         ss.eBufferFormat = NVFBC_BUFFER_FORMAT_BGRA;
     }
@@ -331,7 +340,12 @@ int main(int argc, char **argv) {
         log_line("SDK too old for NVFBC_BUFFER_FORMAT_YUV420P10LE; "
                  "falling through to BGRA (capability badge will be 'degraded')");
     }
-    ss.eBufferFormat = NVFBC_BUFFER_FORMAT_BGRA;
+    if (want_nv12) {
+        ss.eBufferFormat = NVFBC_BUFFER_FORMAT_NV12;
+        log_line("using NV12 surface (task #20 4:2:0 low-bandwidth path)");
+    } else {
+        ss.eBufferFormat = NVFBC_BUFFER_FORMAT_BGRA;
+    }
 #endif
     ss.ppBuffer      = &pBuffer;
     ss.bWithDiffMap  = NVFBC_FALSE;
@@ -346,9 +360,9 @@ int main(int argc, char **argv) {
     }
 
     log_line("capture loop starting (fps=%d cursor=%d push=%d direct=%d "
-             "want_10bit=%d locked=%ux%u)",
+             "want_10bit=%d want_nv12=%d locked=%ux%u)",
              fps, with_cursor, push_model, direct_capture, want_10bit,
-             gs.screenSize.w, gs.screenSize.h);
+             want_nv12, gs.screenSize.w, gs.screenSize.h);
 
     /* Main capture loop. With push model + blocking grab, NvFBC
      * returns as soon as a new frame is available; otherwise it waits

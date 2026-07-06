@@ -43,6 +43,10 @@ from common.messages import (
     QualitySettings, ServerHelloMsg, parse_message,
 )
 from common.logging import configure as _configure_logging
+# WAN transport: UDP media + hole-punch negotiation (task #14). Video goes
+# over UDP datagrams once the client confirms the probe; control stays on WS.
+from common.udp_transport import UDPMediaServer
+from common.hybrid_transport import HybridServerTransport, TransportMsg
 from server.platform_backends import IS_MACOS
 from server.video_encoder import check_ffmpeg_available, detect_encoders
 from server.auth import Authenticator
@@ -275,6 +279,9 @@ async def handle_client(websocket: WebSocketServerProtocol):
             requires_auth=auth.enabled,
             encoder_backend=encoder_backend,
             available_encoders=ffmpeg_caps.get("encoders", {}),
+            # Task #19: active codec so UDP-delivered frames (no in-band
+            # codec) decode correctly on the client (HEVC/AV1).
+            codec=runtime.quality.codec.lower(),
         )
         # color_caps is only a valid kwarg once plan 02-02 extends
         # ServerHelloMsg. Pass it defensively so bootstrap works in the
@@ -292,12 +299,27 @@ async def handle_client(websocket: WebSocketServerProtocol):
         # Register client
         runtime.add_client(websocket, session)
         session.start_sender()
+        # Give the runtime the UDP send path (task #14). Set per-connection so
+        # PAM-created runtimes get it too, without an import cycle.
+        runtime.hybrid_transport = hybrid_transport
+        runtime.udp_server = udp_server
 
         # ── Process messages ─────────────────────────────────
+        _TRANSPORT_MSGS = (TransportMsg.UDP_ANNOUNCE, TransportMsg.UDP_CONFIRMED,
+                           TransportMsg.UDP_STATS)
         async for message in websocket:
             if isinstance(message, str):
                 try:
                     msg = parse_message(message)
+                    # UDP negotiation runs here (async context) rather than in
+                    # the sync handle_input dispatcher.
+                    if msg.get("type") in _TRANSPORT_MSGS:
+                        if hybrid_transport is not None:
+                            resp = await hybrid_transport.handle_transport_message(
+                                session.client_id, msg, websocket.send)
+                            if resp:
+                                await websocket.send(json.dumps(resp))
+                        continue
                     runtime.handle_input(session, msg)
                 except json.JSONDecodeError:
                     logger.warning("Invalid JSON from %s", addr)
@@ -319,10 +341,17 @@ async def handle_client(websocket: WebSocketServerProtocol):
         session.stop()
         if runtime:
             runtime.remove_client(websocket)
+        if hybrid_transport is not None:
+            hybrid_transport.remove_client(session.client_id)
         logger.info("Client removed: %s (%s)", addr, session.username)
 
 
 broker_secret: str = ""  # Shared secret for broker token verification
+
+# UDP media transport (task #14). Bound on the same port number as the TCP
+# WebSocket (UDP and TCP port spaces are separate). None => TCP-only fallback.
+udp_server: Optional[UDPMediaServer] = None
+hybrid_transport: Optional[HybridServerTransport] = None
 
 
 # HTTP status endpoint lives in server/status_endpoint.py; handle_http is
@@ -335,9 +364,23 @@ handle_http = make_status_handler(
 
 async def run_server(host: str, port: int, tls_context: Optional[ssl.SSLContext]):
     """Start the WebSocket server."""
-    global running
+    global running, udp_server, hybrid_transport
 
     logger.info("Starting Teraguchi server on %s:%d", host, port)
+
+    # UDP media transport on the same port number (task #14). If the bind
+    # fails we log and stay TCP-only — the client falls back automatically
+    # when no probe arrives.
+    try:
+        udp_server = UDPMediaServer(host=host, port=port)
+        udp_server.start()
+        hybrid_transport = HybridServerTransport(udp_server)
+        logger.info("UDP media transport enabled on %s:%d/udp "
+                    "(hole-punch + probe negotiation)", host, port)
+    except OSError as e:
+        udp_server = None
+        hybrid_transport = None
+        logger.warning("UDP media bind failed (%s) — TCP-only mode", e)
     if tls_context:
         logger.info("TLS enabled")
     if auth.mode == "pam":

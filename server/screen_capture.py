@@ -141,7 +141,8 @@ class ScreenCapture:
 
     def __init__(self, monitor_index: int = 1,
                  jpeg_quality: int = DEFAULT_JPEG_QUALITY,
-                 want_10bit: bool = False):
+                 want_10bit: bool = False,
+                 want_nv12: bool = False):
         """
         Args:
             monitor_index: 0 = all monitors (virtual desktop),
@@ -160,6 +161,12 @@ class ScreenCapture:
         # ``build_color_caps()`` helper to override negotiated_state
         # when the live capture path can't honor the advertised cap.
         self._want_10bit: bool = bool(want_10bit)
+        # Task #20: NV12 capture surface for 4:2:0 encodes — 1.5 B/px vs
+        # BGRA's 4 (a 4K frame drops 33->12.4 MB per pipe hop) and the
+        # RGB->YUV conversion runs on the GPU. Only honored when NvFBC is
+        # live; ``output_format`` tells the encoder what it's being fed.
+        self._want_nv12: bool = bool(want_nv12) and not self._want_10bit
+        self.output_format: str = "bgra"
         self._using_mss_fallback: bool = False
         self._sct = mss.mss()
         self._last_frame: Optional[np.ndarray] = None
@@ -197,12 +204,15 @@ class ScreenCapture:
                     # silently fall through to BGRA on older drivers;
                     # runtime_capability_state surfaces that.
                     want_10bit=self._want_10bit,
+                    want_nv12=self._want_nv12,
                 )
                 # NvFBC captures the whole screen — override width/height
                 # so downstream encoders see the real framebuffer size
                 # instead of mss's first-monitor view.
                 self.width = self._nvfbc.width
                 self.height = self._nvfbc.height
+                if self._want_nv12:
+                    self.output_format = "nv12"
             except Exception as e:
                 logger.warning("NvFBC backend unavailable (%s) — "
                                "falling back to mss/XShmGetImage", e)
