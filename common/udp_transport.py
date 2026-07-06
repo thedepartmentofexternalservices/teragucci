@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 # Constants
 UDP_MAGIC = 0x5447           # 'TG' for Teraguchi
 UDP_HEADER_SIZE = 16
-DEFAULT_MTU = 1400           # Conservative MTU leaving room for IP/UDP/DTLS headers
+# Measured 2026-07: the Oslo→London VPN tunnel drops UDP payloads >1250 B
+# (path MTU ~1278). 1400 caused ~35% silent video-fragment loss — every
+# full-size fragment vanished while small ones passed. 1200 leaves margin
+# for varying tunnel overhead. TODO: per-path MTU probe during negotiation.
+DEFAULT_MTU = 1200           # Conservative MTU leaving room for IP/UDP/DTLS headers
 MAX_PACKET_SIZE = 65507      # Max UDP payload
 
 # Channel IDs
@@ -55,6 +59,12 @@ CHANNEL_AUDIO = 0x02
 FLAG_KEYFRAME = 0x01
 FLAG_FRAGMENT = 0x02
 FLAG_LAST_FRAGMENT = 0x04
+FLAG_FEC = 0x08              # XOR parity packet (task #17)
+
+# FEC group size: one XOR parity packet per K data fragments recovers any
+# single lost fragment in the group (the dominant WAN loss pattern is
+# isolated single-packet drops). Overhead = 1/K = 12.5%.
+FEC_GROUP = 8
 
 
 def encode_udp_header(channel: int, flags: int, sequence: int,
@@ -118,10 +128,12 @@ class FrameFragmenter:
 
         # Fragment
         fragments = []
+        chunks = []
         total = (len(data) + self.payload_size - 1) // self.payload_size
         for i in range(total):
             offset = i * self.payload_size
             chunk = data[offset:offset + self.payload_size]
+            chunks.append(chunk)
 
             flags = base_flags | FLAG_FRAGMENT
             if i == total - 1:
@@ -129,6 +141,28 @@ class FrameFragmenter:
 
             header = encode_udp_header(channel, flags, seq, timestamp_ms, i, total)
             fragments.append(header + chunk)
+
+        # FEC (task #17): one XOR parity per FEC_GROUP data fragments for
+        # video. Parity block = XOR over [len:2B][chunk zero-padded]; any
+        # single lost fragment in the group is recoverable. frag_id carries
+        # the group index; frag_total mirrors the frame's so the receiver
+        # can derive the group's span. 12.5% overhead, video only.
+        if channel == CHANNEL_VIDEO:
+            blk_len = 2 + self.payload_size
+            for g in range(0, total, FEC_GROUP):
+                group = chunks[g:g + FEC_GROUP]
+                # NB: a singleton tail group still gets parity — the XOR of
+                # one block is the block itself, i.e. a retransmit copy, and
+                # without it the frame's last fragment is unprotected.
+                parity = bytearray(blk_len)
+                for chunk in group:
+                    blk = len(chunk).to_bytes(2, "big") + chunk
+                    for j, b in enumerate(blk):
+                        parity[j] ^= b
+                header = encode_udp_header(
+                    channel, base_flags | FLAG_FRAGMENT | FLAG_FEC,
+                    seq, timestamp_ms, g // FEC_GROUP, total)
+                fragments.append(header + bytes(parity))
 
         return fragments
 
@@ -147,6 +181,8 @@ class PendingFrame:
     total_fragments: int = 0
     received_fragments: Dict[int, bytes] = field(default_factory=dict)
     created_at: float = 0.0
+    # FEC (task #17): group_index -> XOR parity block ([len:2B]+padded data)
+    fec_packets: Dict[int, bytes] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -194,8 +230,11 @@ class FrameReassembler:
         channel, flags, seq, ts, frag_id, frag_total, payload = parsed
         self._packets_received += 1
 
-        # Skip frames older than what we've already displayed
-        if seq < self._last_complete_seq.get(channel, 0):
+        # Skip frames at-or-older than what we've already completed. MUST be
+        # <= (not <): a trailing FEC parity packet for an already-completed
+        # frame would otherwise resurrect it as a ghost PendingFrame that
+        # never completes — polluting loss stats and leaking memory.
+        if seq <= self._last_complete_seq.get(channel, 0):
             return None
 
         # Single-packet frame (no fragmentation)
@@ -218,11 +257,20 @@ class FrameReassembler:
             )
 
         frame = self._pending[key]
-        frame.received_fragments[frag_id] = payload
+        if flags & FLAG_FEC:
+            # Parity packet: frag_id is the FEC group index.
+            frame.fec_packets[frag_id] = payload
+        else:
+            frame.received_fragments[frag_id] = payload
 
         # Inherit keyframe flag from any fragment
         if flags & FLAG_KEYFRAME:
             frame.flags |= FLAG_KEYFRAME
+
+        # FEC recovery: if any group is missing exactly one data fragment
+        # and its parity arrived, XOR-reconstruct the missing one.
+        if frame.fec_packets and not frame.complete:
+            self._try_fec_recover(frame)
 
         if frame.complete:
             del self._pending[key]
@@ -232,6 +280,36 @@ class FrameReassembler:
             return channel, frame.flags, frame.timestamp_ms, frame.assemble()
 
         return None
+
+    def _try_fec_recover(self, frame: "PendingFrame"):
+        """XOR-recover single missing fragments per FEC group (task #17).
+
+        Parity block layout: [len:2B][chunk padded to block size]. XORing
+        the parity with every *received* block in the group leaves exactly
+        the missing block when one fragment was lost.
+        """
+        total = frame.total_fragments
+        for g, parity in list(frame.fec_packets.items()):
+            lo = g * FEC_GROUP
+            hi = min(lo + FEC_GROUP, total)
+            missing = [i for i in range(lo, hi)
+                       if i not in frame.received_fragments]
+            if len(missing) != 1:
+                continue
+            blk = bytearray(parity)
+            for i in range(lo, hi):
+                if i == missing[0]:
+                    continue
+                chunk = frame.received_fragments[i]
+                other = len(chunk).to_bytes(2, "big") + chunk
+                for j, b in enumerate(other):
+                    blk[j] ^= b
+            length = int.from_bytes(blk[:2], "big")
+            if 0 < length <= len(blk) - 2:
+                frame.received_fragments[missing[0]] = bytes(blk[2:2 + length])
+                self._frames_recovered_fec = getattr(
+                    self, "_frames_recovered_fec", 0) + 1
+                del frame.fec_packets[g]
 
     def _cleanup_old(self, channel: int, current_seq: int):
         """Drop pending frames that are older than the current completed frame."""
@@ -274,6 +352,7 @@ class FrameReassembler:
             "packet_loss_rate": round(self.packet_loss_rate * 100, 2),
             "frames_completed": self._frames_completed,
             "frames_dropped": self._frames_dropped,
+            "frames_recovered_fec": getattr(self, "_frames_recovered_fec", 0),
             "pending_frames": len(self._pending),
         }
 
@@ -282,13 +361,23 @@ class FrameReassembler:
 # UDP Server Transport
 # ============================================================
 
+# NAT hole-punch packet magic. The client sends `PUNCH_MAGIC + token` datagrams
+# to the server's UDP port right after UDP_ANNOUNCE; the server's recv loop
+# matches the token (which traveled over the authenticated WebSocket) and
+# registers the client's *observed* source address. Required whenever the
+# client sits behind NAT/VPN (its announced local addr is unreachable).
+PUNCH_MAGIC = b"TGPN1"
+
+
 class UDPMediaServer:
     """
     Server-side UDP transport for media streaming.
 
     Sends video and audio frames as UDP datagrams to connected clients.
     Each client must first register via the TCP control channel, which
-    provides the client's UDP address.
+    provides the client's UDP address — and/or via a NAT hole-punch
+    datagram, which provides the client's *observed* address (the one
+    that actually works through NAT/VPN).
     """
 
     def __init__(self, host: str = "0.0.0.0", port: int = 443,
@@ -302,7 +391,13 @@ class UDPMediaServer:
         self._send_lock = threading.Lock()
         self._total_bytes_sent = 0
         self._total_packets_sent = 0
+        self._frames_sent_udp = 0
+        self._send_errors = 0
         self._start_time = 0.0
+        self._recv_thread: Optional[threading.Thread] = None
+        # Called from the recv thread as on_punch(token: str, addr: tuple)
+        # when a hole-punch datagram arrives. Wired by HybridServerTransport.
+        self.on_punch: Optional[Callable] = None
 
     @property
     def bandwidth_mbps(self) -> float:
@@ -312,13 +407,83 @@ class UDPMediaServer:
         return (self._total_bytes_sent * 8) / (elapsed * 1_000_000)
 
     def start(self):
-        """Create and bind the UDP socket."""
+        """Create and bind the UDP socket + start the punch recv loop."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         self._sock.bind((self.host, self.port))
+        self._sock.settimeout(1.0)
         self._running = True
         self._start_time = time.time()
+        # Recv loop: the only client->server UDP traffic is hole-punch
+        # datagrams; everything else is ignored. This is what lets us learn
+        # the client's observed (post-NAT) address.
+        self._recv_thread = threading.Thread(
+            target=self._recv_loop, daemon=True, name="udp-media-punch-recv")
+        self._recv_thread.start()
         logger.info("UDP media server listening on %s:%d", self.host, self.port)
+
+    def _recv_loop(self):
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._running:
+                    logger.debug("UDP server recv error")
+                break
+            if data.startswith(PUNCH_MAGIC) and self.on_punch:
+                token = data[len(PUNCH_MAGIC):].decode("ascii", "ignore")
+                try:
+                    self.on_punch(token, addr)
+                except Exception as e:  # never kill the recv loop
+                    logger.warning("on_punch handler error: %s", e)
+
+    def send_probe(self, addr: tuple, payload: bytes):
+        """Send a probe frame to one explicit address (not the client table).
+
+        Used during negotiation: probes go to the announced addr AND the
+        punch-observed addr; whichever is reachable delivers.
+        """
+        if not self._running:
+            return
+        packets = self._fragmenter.fragment_frame(
+            CHANNEL_VIDEO, payload, int(time.time() * 1000), False)
+        with self._send_lock:
+            for packet in packets:
+                try:
+                    self._sock.sendto(packet, addr)
+                except OSError as e:
+                    logger.debug("UDP probe to %s failed: %s", addr, e)
+
+    def send_video_frame_to(self, client_id: str, data: bytes,
+                            timestamp_ms: int, is_keyframe: bool = False) -> bool:
+        """Send a video frame to ONE registered client. Returns False if the
+        client is not registered (caller should fall back to TCP)."""
+        addr = self._clients.get(client_id)
+        if not self._running or addr is None:
+            return False
+        packets = self._fragmenter.fragment_frame(
+            CHANNEL_VIDEO, data, timestamp_ms, is_keyframe)
+        with self._send_lock:
+            for i, packet in enumerate(packets):
+                try:
+                    self._sock.sendto(packet, addr)
+                    self._total_bytes_sent += len(packet)
+                    self._total_packets_sent += 1
+                except OSError as e:
+                    self._send_errors += 1
+                    logger.debug("UDP send to %s failed: %s", client_id, e)
+                    return False
+                # Burst pacing: blasting a large frame (keyframe ≈ 90 pkts)
+                # at line rate overruns VPN-tunnel encap queues and the whole
+                # tail vanishes. A ~50 µs gap every few packets keeps the
+                # burst under queue depth at negligible latency cost
+                # (90 pkts ≈ +1.5 ms worst case on keyframes only).
+                if i % 4 == 3:
+                    time.sleep(0.00005)
+            self._frames_sent_udp += 1
+        return True
 
     def register_client(self, client_id: str, addr: tuple):
         """Register a client's UDP address for receiving media."""
@@ -443,6 +608,26 @@ class UDPMediaClient:
 
         logger.info("UDP media client listening on port %d", self._local_port)
         return self._local_port
+
+    def punch(self, server_addr: tuple, token: str, count: int = 3):
+        """Send NAT hole-punch datagrams to the server's UDP port.
+
+        Sent from the SAME socket that listens for media, which (a) opens
+        the NAT/VPN pinhole for the server's return traffic and (b) shows
+        the server our observed source address. The token ties the punch
+        to our authenticated WebSocket session (it was sent in
+        UDP_ANNOUNCE over TCP), so the server won't register strangers.
+        """
+        if self._sock is None:
+            return
+        pkt = PUNCH_MAGIC + token.encode("ascii")
+        for _ in range(count):
+            try:
+                self._sock.sendto(pkt, server_addr)
+            except OSError as e:
+                logger.debug("UDP punch failed: %s", e)
+                return
+            time.sleep(0.05)
 
     def _receive_loop(self):
         """Receive and process UDP packets."""

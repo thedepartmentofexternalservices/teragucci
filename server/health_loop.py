@@ -88,7 +88,40 @@ class HealthLoop:
             if not self._runtime.clients:
                 continue
             seq = self._runtime.health.next_ping_sequence()
-            stats_json = self._runtime.health.get_stats().to_json()
+            stats = self._runtime.health.get_stats()
+            stats_json = stats.to_json()
+            # OBS — sysadmin telemetry. One greppable key=value line every 2 s
+            # (grep 'teraguchi.stats' /var/log/teraguchi/server.log). The same
+            # fields are exposed as JSON at GET /status for Zabbix polling.
+            # stage_sum_ms = measured capture+encode+transmit+decode+display
+            # (an end-to-end latency proxy; each stage is independently visible).
+            logger.info(
+                "teraguchi.stats user=%s clients=%d fps=%.1f/%.0f "
+                "capture_ms=%.1f encode_ms=%.1f transmit_ms=%.1f decode_ms=%.1f "
+                "display_ms=%.1f stage_sum_ms=%.1f rtt_ms=%.1f bitrate_mbps=%.2f "
+                "frames_sent=%d drops=%d kf_req=%d kf_emit=%d codec=%s chroma=%s res=%s",
+                getattr(self._runtime, "username", "-"),
+                stats.clients_connected, stats.fps_actual, stats.fps_target,
+                stats.capture_time_ms, stats.encode_time_ms, stats.transmit_time_ms,
+                stats.decode_time_ms, stats.display_time_ms,
+                (stats.capture_time_ms + stats.encode_time_ms + stats.transmit_time_ms
+                 + stats.decode_time_ms + stats.display_time_ms),
+                stats.rtt_ms, stats.bandwidth_mbps, stats.frames_sent,
+                stats.frames_dropped, stats.keyframe_requested, stats.keyframe_emitted,
+                stats.codec, stats.chroma, stats.resolution,
+            )
+            # UDP transport counters (task #14/#16 diagnostics): compare
+            # udp_frames vs frames_sent to see how much video rides UDP,
+            # and packet/error counts for tunnel-loss debugging.
+            udp = getattr(self._runtime, "udp_server", None)
+            if udp is not None:
+                logger.info(
+                    "teraguchi.udp frames=%d packets=%d bytes=%d errors=%d "
+                    "bandwidth_mbps=%.2f",
+                    udp._frames_sent_udp, udp._total_packets_sent,
+                    udp._total_bytes_sent, udp._send_errors,
+                    udp.bandwidth_mbps,
+                )
             for ws, cs in list(self._runtime.clients.items()):
                 if cs.authenticated:
                     try:

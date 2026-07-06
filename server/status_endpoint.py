@@ -71,6 +71,21 @@ def make_status_handler(
             if not gpu and default_runtime and default_runtime.encoder:
                 gpu = default_runtime.encoder.active_backend or ""
 
+            # OBS — per-session latency/throughput breakdown so a monitoring
+            # system (Zabbix) can poll GET /status and alert on any stage.
+            # Same fields as the greppable 'teraguchi.stats' log line.
+            sessions = []
+            _all_rt = dict(runtimes)
+            if default_runtime is not None:
+                _all_rt.setdefault("_default", default_runtime)
+            for uname, rt in _all_rt.items():
+                try:
+                    st = json.loads(rt.health.get_stats().to_json())
+                    st["user"] = uname
+                    sessions.append(st)
+                except Exception:
+                    continue
+
             status = {
                 "active_sessions": active_sessions,
                 "load_avg": load_avg,
@@ -78,6 +93,7 @@ def make_status_handler(
                 "gpu": gpu,
                 "hostname": _platform_mod.node(),
                 "version": "3.0.0",
+                "sessions": sessions,
             }
 
             body = json.dumps(status).encode()

@@ -84,7 +84,10 @@ class HybridServerTransport:
     whether to send media over UDP or fall back to TCP.
     """
 
-    UDP_PROBE_TIMEOUT = 3.0  # seconds to wait for UDP confirmation
+    # Generous: a busy client event loop (decoding a full-rate TCP stream
+    # while negotiating) can delay the confirm by several seconds. Measured
+    # 3.9 s on a WAN client under load — 3 s timed out spuriously.
+    UDP_PROBE_TIMEOUT = 10.0  # seconds to wait for UDP confirmation
     UDP_PROBE_RETRIES = 3
 
     def __init__(self, udp_server):
@@ -94,6 +97,40 @@ class HybridServerTransport:
         """
         self._udp_server = udp_server
         self._client_states: dict = {}  # client_id -> TransportState
+        # NAT hole-punch bookkeeping. Tokens travel over the authenticated
+        # WebSocket (UDP_ANNOUNCE); punch datagrams carrying the same token
+        # reveal the client's observed (post-NAT) address.
+        self._token_to_client: dict = {}   # punch_token -> client_id
+        self._early_punches: dict = {}     # punch_token -> observed addr
+        # Wire the punch callback (called from the UDP recv thread).
+        self._udp_server.on_punch = self.handle_punch
+
+    def _probe_payload(self) -> bytes:
+        return json.dumps({
+            "type": TransportMsg.UDP_PROBE,
+            "timestamp": int(time.time() * 1000),
+        }).encode()
+
+    def handle_punch(self, token: str, addr: tuple):
+        """Punch datagram arrived (UDP recv thread). Register the client's
+        OBSERVED address — the one that actually traverses NAT/VPN — and
+        probe it immediately.
+
+        May fire before or after the UDP_ANNOUNCE that carries the token;
+        both orders are handled.
+        """
+        client_id = self._token_to_client.get(token)
+        if client_id is None:
+            # Punch raced ahead of the announce — stash for later.
+            self._early_punches[token] = addr
+            return
+        state = self.get_state(client_id)
+        state.client_udp_addr, state.client_udp_port = addr[0], addr[1]
+        self._udp_server.register_client(client_id, addr)
+        logger.info("Client %s: punch observed from %s:%d — probing observed addr",
+                    client_id, addr[0], addr[1])
+        for _ in range(self.UDP_PROBE_RETRIES):
+            self._udp_server.send_probe(addr, self._probe_payload())
 
     def get_state(self, client_id: str) -> TransportState:
         if client_id not in self._client_states:
@@ -119,30 +156,36 @@ class HybridServerTransport:
             # Client is telling us its UDP address
             state.client_udp_port = msg.get("udp_port", 0)
             state.client_udp_addr = msg.get("udp_addr", "")
+            punch_token = msg.get("punch_token", "")
 
             if not state.client_udp_port:
                 logger.warning("Client %s announced invalid UDP port", client_id)
                 return None
 
-            # Register with UDP server and send probes
-            addr = (state.client_udp_addr, state.client_udp_port)
-            self._udp_server.register_client(client_id, addr)
-
-            # Send UDP probe packets
-            logger.info("Client %s announced UDP %s:%d, sending probes...",
-                        client_id, state.client_udp_addr, state.client_udp_port)
-
             state.udp_probe_sent_at = time.time()
-            probe_data = json.dumps({
-                "type": TransportMsg.UDP_PROBE,
-                "timestamp": int(time.time() * 1000),
-            }).encode()
 
-            # Send multiple probes (UDP may drop some)
-            for i in range(self.UDP_PROBE_RETRIES):
-                self._udp_server.send_video_frame(
-                    probe_data, int(time.time() * 1000), is_keyframe=False)
-                await asyncio.sleep(0.1)
+            # NAT path: remember the token so an incoming punch datagram can
+            # be matched to this client. If the punch already arrived (it
+            # races the announce), register the observed addr right now.
+            if punch_token:
+                self._token_to_client[punch_token] = client_id
+                early = self._early_punches.pop(punch_token, None)
+                if early is not None:
+                    self.handle_punch(punch_token, early)
+
+            # LAN path: the announced addr may be directly reachable. Probe
+            # it too; only the reachable address will actually deliver, and
+            # a later punch overwrites the registration with the observed
+            # addr (which also works on a LAN).
+            if state.client_udp_addr and not state.using_udp:
+                addr = (state.client_udp_addr, state.client_udp_port)
+                if client_id not in getattr(self._udp_server, "_clients", {}):
+                    self._udp_server.register_client(client_id, addr)
+                logger.info("Client %s announced UDP %s:%d, sending probes...",
+                            client_id, state.client_udp_addr, state.client_udp_port)
+                for _ in range(self.UDP_PROBE_RETRIES):
+                    self._udp_server.send_probe(addr, self._probe_payload())
+                    await asyncio.sleep(0.1)
 
             # Start a timeout check
             asyncio.get_event_loop().call_later(
@@ -158,8 +201,15 @@ class HybridServerTransport:
             state.udp_confirmed = True
             state.mode = TransportMode.UDP_MEDIA
 
-            logger.info("Client %s: UDP confirmed (RTT: %.1f ms). Switching to UDP media.",
-                        client_id, state.udp_rtt_ms)
+            # A confirm may arrive AFTER the probe timeout already
+            # unregistered this client — re-register the known-good
+            # (observed) address so send_video_frame_to works again.
+            if state.client_udp_addr and state.client_udp_port:
+                self._udp_server.register_client(
+                    client_id, (state.client_udp_addr, state.client_udp_port))
+
+            logger.info("Client %s: UDP confirmed (negotiation took %.1f ms). "
+                        "Switching to UDP media.", client_id, state.udp_rtt_ms)
 
             return {
                 "type": TransportMsg.UDP_ACTIVE,
