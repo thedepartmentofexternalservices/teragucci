@@ -17,3 +17,9 @@ server/nvfbc/*.o
 
 # TLS certificates — generated per-host, never committed
 certs/
+
+# gstack workspace
+.gstack/
+
+# Test-lab host inventory (local only)
+scripts/hosts.env

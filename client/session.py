@@ -5,6 +5,7 @@ Encapsulates protocol, viewer, decoder, audio, health data, and all
 signal wiring for a single remote desktop session. Multiple sessions
 can exist simultaneously (one per tab).
 """
+from __future__ import annotations  # keep `X | None` annotations lazy (3.9 floor)
 
 import json
 import logging
