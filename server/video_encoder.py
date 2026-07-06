@@ -125,12 +125,17 @@ def detect_encoders() -> Dict[str, List[HWEncoder]]:
 
 
 def select_best_encoder(codec: str, available: Dict[str, List[HWEncoder]],
-                        need_444: bool = False, need_lossless: bool = False) -> Optional[HWEncoder]:
+                        need_444: bool = False, need_lossless: bool = False,
+                        need_422: bool = False) -> Optional[HWEncoder]:
     """
     Select the best available encoder for the given codec and requirements.
 
-    Prefers hardware encoders. If 4:4:4 or lossless is required and no
+    Prefers hardware encoders. If 4:4:4 / 4:2:2 / lossless is required and no
     hardware encoder supports it, falls back to software.
+
+    The 4:2:2 gate (task #15): pre-Blackwell NVENC advertises fine but dies
+    at InitializeEncoder with yuv422p ("No capable devices") — without this
+    check the pipeline started, produced ZERO frames, and never fell back.
     """
     candidates = available.get(codec, [])
     if not candidates:
@@ -140,6 +145,10 @@ def select_best_encoder(codec: str, available: Dict[str, List[HWEncoder]],
         if need_444 and not enc.supports_444:
             continue
         if need_lossless and not enc.supports_lossless:
+            continue
+        if need_422 and not (enc.supports_422 or enc.backend == "software"):
+            # HW encoders that can't do 4:2:2 fail at runtime, not here —
+            # software (libx264/libx265) always can.
             continue
         return enc
 
@@ -161,10 +170,14 @@ class VideoEncoder:
     """
 
     def __init__(self, width: int, height: int, settings: QualitySettings,
-                 available_encoders: Optional[Dict[str, List[HWEncoder]]] = None):
+                 available_encoders: Optional[Dict[str, List[HWEncoder]]] = None,
+                 input_pix_fmt: str = "bgra"):
         self.width = width
         self.height = height
         self.settings = settings
+        # Task #20: what the capture backend feeds us ("bgra" or "nv12").
+        # NV12 = 2.7x less pipe traffic + GPU-side RGB->YUV at 4K.
+        self.input_pix_fmt = input_pix_fmt
         self._available = available_encoders if available_encoders is not None else detect_encoders()
         self._active_encoder: Optional[HWEncoder] = None
         self._process: Optional[subprocess.Popen] = None
@@ -261,13 +274,19 @@ class VideoEncoder:
             codec = "h264"
 
         need_444 = self.settings.effective_chroma() == ChromaSubsampling.YUV444
+        need_422 = self.settings.effective_chroma() == ChromaSubsampling.YUV422
         need_lossless = self.settings.force_lossless
 
-        enc = select_best_encoder(codec, self._available, need_444, need_lossless)
+        enc = select_best_encoder(codec, self._available, need_444, need_lossless,
+                                  need_422=need_422)
         if enc is None:
             # Absolute fallback
             enc = HWEncoder("libx264", "h264", "software",
                             supports_444=True, supports_lossless=True, priority=100)
+        if need_422 and enc.backend != "software" and not enc.supports_422:
+            # Loud, explicit downgrade guard (no-silent-downgrade contract).
+            logger.warning("4:2:2 requested but %s cannot encode it — "
+                           "falling back to software x264/x265", enc.name)
 
         logger.info("Selected encoder: %s (backend=%s, 444=%s, lossless=%s)",
                      enc.name, enc.backend, enc.supports_444, enc.supports_lossless)
@@ -326,8 +345,9 @@ class VideoEncoder:
             pix_fmt_in = "p010le"
             pix_fmt_out = "p010le"
         else:
-            # Phase 1 8-bit BGRA → YUV path. Chroma policy unchanged.
-            pix_fmt_in = "bgra"
+            # Phase 1 8-bit path. Input is whatever the capture backend
+            # feeds (task #20: "nv12" for GPU-converted 4:2:0, else "bgra").
+            pix_fmt_in = self.input_pix_fmt or "bgra"
             if chroma == ChromaSubsampling.YUV444:
                 if enc.supports_444:
                     pix_fmt_out = "yuv444p"
@@ -746,14 +766,51 @@ class VideoEncoder:
         else:
             self._read_h264_output()
 
-    def _read_h264_output(self):
-        """Read H.264 NAL units delimited by start codes."""
+    def _read_annexb_output(self, is_vcl, is_keyframe_fn):
+        """Read an Annex-B elementary stream and emit ONE callback per
+        access unit (frame), not per NAL.
+
+        Why (task #16 root cause): the old per-NAL splitter fired ~2
+        callbacks per real frame on NVENC (SEI/SPS/PPS + slice), which
+        inflated fps stats to ~115@60, doubled UDP fragment overhead, and
+        confused the client jitter buffer. Worse, a NAL is only bounded by
+        the NEXT start code — so the slice NAL (99% of the frame's bytes)
+        used to wait for the *next frame's* first NAL: a hidden +1 frame
+        period (16.7 ms @60) of latency on every frame.
+
+        AU grouping rule: NALs accumulate; seeing a second VCL NAL flushes
+        the previous AU. Zero-lookahead flush: ffmpeg writes each encoded
+        AU as one burst — when a read() returns short (< bufsize, pipe
+        momentarily drained) and the accumulator holds a complete AU with
+        a VCL NAL, flush it NOW instead of waiting for the next frame.
+        (Edge case: an AU that is an exact multiple of the read size
+        flushes on the next burst — rare and only costs what the old code
+        always cost.)
+
+        Args:
+            is_vcl: callable(nal_bytes) -> bool, codec-specific VCL test.
+                nal_bytes starts with the 4-byte start code.
+            is_keyframe_fn: callable(au_bytes) -> bool for the whole AU.
+        """
         buf = bytearray()
+        au = bytearray()          # current access unit accumulator
+        au_has_vcl = False
         START_CODE = b'\x00\x00\x00\x01'
+        READ_SIZE = 65536
+
+        def flush_au():
+            nonlocal au, au_has_vcl
+            if au:
+                frame = bytes(au)
+                self._total_bytes += len(frame)
+                if self._on_encoded_frame:
+                    self._on_encoded_frame(frame, is_keyframe_fn(frame))
+            au = bytearray()
+            au_has_vcl = False
 
         try:
             while self._running and self._process and self._process.poll() is None:
-                chunk = self._process.stdout.read(65536)
+                chunk = self._process.stdout.read(READ_SIZE)
                 if not chunk:
                     break
                 buf.extend(chunk)
@@ -762,49 +819,51 @@ class VideoEncoder:
                     idx = buf.find(START_CODE, 4)
                     if idx < 0:
                         break
-
                     nal_data = bytes(buf[:idx])
                     buf = buf[idx:]
-
                     if len(nal_data) > 4:
-                        is_keyframe = self._is_h264_keyframe(nal_data)
-                        self._total_bytes += len(nal_data)
-                        if self._on_encoded_frame:
-                            self._on_encoded_frame(nal_data, is_keyframe)
+                        if is_vcl(nal_data):
+                            if au_has_vcl:
+                                flush_au()   # new frame begins
+                            au_has_vcl = True
+                        au.extend(nal_data)
 
+                # Burst drained? The tail NAL in ``buf`` is complete (ffmpeg
+                # writes whole AUs); absorb it and flush the AU immediately —
+                # this is the zero-lookahead, latency-critical path.
+                if len(chunk) < READ_SIZE and len(buf) > 4:
+                    nal_data = bytes(buf)
+                    buf = bytearray()
+                    if is_vcl(nal_data):
+                        if au_has_vcl:
+                            flush_au()
+                        au_has_vcl = True
+                    au.extend(nal_data)
+                if len(chunk) < READ_SIZE and au_has_vcl:
+                    flush_au()
+
+            flush_au()  # EOF: emit whatever is left
         except Exception as e:
             if self._running:
-                logger.error("H264 reader error: %s", e)
+                logger.error("AnnexB reader error: %s", e)
+
+    @staticmethod
+    def _h264_is_vcl(nal: bytes) -> bool:
+        # nal[4] follows the 4-byte start code; H.264 VCL = types 1..5
+        return 1 <= (nal[4] & 0x1F) <= 5
+
+    @staticmethod
+    def _hevc_is_vcl(nal: bytes) -> bool:
+        # HEVC nal_unit_type = (byte >> 1) & 0x3F; VCL = 0..31
+        return ((nal[4] >> 1) & 0x3F) <= 31
+
+    def _read_h264_output(self):
+        """Read H.264 — one callback per access unit (see _read_annexb_output)."""
+        self._read_annexb_output(self._h264_is_vcl, self._is_h264_keyframe)
 
     def _read_hevc_output(self):
-        """Read H.265/HEVC NAL units delimited by start codes."""
-        buf = bytearray()
-        START_CODE = b'\x00\x00\x00\x01'
-
-        try:
-            while self._running and self._process and self._process.poll() is None:
-                chunk = self._process.stdout.read(65536)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-
-                while True:
-                    idx = buf.find(START_CODE, 4)
-                    if idx < 0:
-                        break
-
-                    nal_data = bytes(buf[:idx])
-                    buf = buf[idx:]
-
-                    if len(nal_data) > 4:
-                        is_keyframe = self._is_hevc_keyframe(nal_data)
-                        self._total_bytes += len(nal_data)
-                        if self._on_encoded_frame:
-                            self._on_encoded_frame(nal_data, is_keyframe)
-
-        except Exception as e:
-            if self._running:
-                logger.error("HEVC reader error: %s", e)
+        """Read HEVC — one callback per access unit (see _read_annexb_output)."""
+        self._read_annexb_output(self._hevc_is_vcl, self._is_hevc_keyframe)
 
     def _read_ivf_output(self):
         """Read AV1 frames from IVF container."""
@@ -840,25 +899,31 @@ class VideoEncoder:
 
     @staticmethod
     def _is_h264_keyframe(nal_data: bytes) -> bool:
-        if len(nal_data) < 5:
-            return False
-        offset = 4 if nal_data[:4] == b'\x00\x00\x00\x01' else 3
-        if offset >= len(nal_data):
-            return False
-        nal_type = nal_data[offset] & 0x1F
-        return nal_type == 5  # IDR slice
+        # AU-aware (task #16): the buffer may hold a whole access unit
+        # ([SPS][PPS][SEI][IDR slice]); scan every NAL, not just the first —
+        # checking only NAL 0 misses the IDR behind SPS/PPS and breaks
+        # keyframe flags downstream (jitter buffer, IDR-on-drop).
+        pos = 0
+        while True:
+            idx = nal_data.find(b'\x00\x00\x00\x01', pos)
+            if idx < 0 or idx + 4 >= len(nal_data):
+                return False
+            if (nal_data[idx + 4] & 0x1F) == 5:  # IDR slice
+                return True
+            pos = idx + 4
 
     @staticmethod
     def _is_hevc_keyframe(nal_data: bytes) -> bool:
-        if len(nal_data) < 5:
-            return False
-        offset = 4 if nal_data[:4] == b'\x00\x00\x00\x01' else 3
-        if offset >= len(nal_data):
-            return False
-        # HEVC NAL type is bits 1-6 of first byte
-        nal_type = (nal_data[offset] >> 1) & 0x3F
-        # IDR types: 19 (IDR_W_RADL), 20 (IDR_N_LP)
-        return nal_type in (19, 20)
+        # AU-aware — see _is_h264_keyframe. HEVC nal type = bits 1-6;
+        # IDR types: 19 (IDR_W_RADL), 20 (IDR_N_LP), 21 (CRA).
+        pos = 0
+        while True:
+            idx = nal_data.find(b'\x00\x00\x00\x01', pos)
+            if idx < 0 or idx + 4 >= len(nal_data):
+                return False
+            if ((nal_data[idx + 4] >> 1) & 0x3F) in (19, 20, 21):
+                return True
+            pos = idx + 4
 
     @staticmethod
     def _is_av1_keyframe(frame_data: bytes) -> bool:
