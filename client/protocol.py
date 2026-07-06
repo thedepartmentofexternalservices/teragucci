@@ -1177,10 +1177,31 @@ class ClientProtocol:
                 local_addr = ""
 
             announce = self._hybrid.get_announce_message(local_addr)
+            # NAT hole-punch: attach a one-time token over the authenticated
+            # WS channel, then fire punch datagrams at the server's UDP port
+            # from the media socket. Behind NAT/VPN the announced local addr
+            # is unreachable — the punch shows the server our observed addr
+            # and opens the return pinhole. On a flat LAN it's a harmless
+            # no-op (the announced-addr probes also arrive).
+            import secrets as _secrets
+            punch_token = _secrets.token_hex(8)
+            announce["punch_token"] = punch_token
             await ws.send(json.dumps(announce))
+            # Server UDP port convention: same number as the TCP port
+            # (both bound by the server; see server main --udp-port).
+            udp_port = getattr(self, "_server_udp_port", 0) or self._port
+            self._udp_client.punch((server_host, udp_port), punch_token)
 
-            await asyncio.sleep(1.0)
-            if self._hybrid.check_probe_received():
+            # Poll for the probe instead of a single check: under load (TCP
+            # frames already streaming + decoding) the event loop can delay
+            # a lone 1 s sleep by seconds and spuriously miss the probe.
+            confirmed = False
+            for _ in range(25):          # up to ~5 s, checking every 200 ms
+                await asyncio.sleep(0.2)
+                if self._hybrid.check_probe_received():
+                    confirmed = True
+                    break
+            if confirmed:
                 confirm = self._hybrid.get_confirm_message()
                 await ws.send(json.dumps(confirm))
                 logger.info("UDP confirmed — media via UDP")
@@ -1241,11 +1262,20 @@ class ClientProtocol:
                          timestamp_ms: int, data: bytes):
         if channel == CHANNEL_VIDEO:
             if self.on_video_frame:
-                # UDP frames don't carry codec/chroma in-band; use FrameType
-                # to signal H.264 (the server encodes the current codec)
+                # UDP frames don't carry codec/chroma in-band; use the codec
+                # negotiated in server_hello (task #19 — the old H.264
+                # hardcode broke HEVC-over-UDP: the decoder got h264 metadata
+                # for hevc bitstream).
                 from common.messages import FrameType, VideoCodec, ChromaSubsampling
+                codec_name = getattr(self, "_negotiated_codec", "") or "h264"
+                if codec_name == "h265":
+                    ft, vc = FrameType.VIDEO_H265, VideoCodec.H265
+                elif codec_name == "av1":
+                    ft, vc = FrameType.VIDEO_AV1, VideoCodec.AV1
+                else:
+                    ft, vc = FrameType.VIDEO_H264, VideoCodec.H264
                 self.on_video_frame(
-                    FrameType.VIDEO_H264, VideoCodec.H264,
+                    ft, vc,
                     ChromaSubsampling.YUV444, flags, timestamp_ms, 0, data)
         elif channel == CHANNEL_AUDIO:
             if self.on_audio_frame:
@@ -1253,6 +1283,10 @@ class ClientProtocol:
 
     def _handle_server_hello(self, msg: dict):
         if msg.get("type") == MsgType.SERVER_HELLO:
+            # Optional override; defaults to the TCP port in _negotiate_udp.
+            self._server_udp_port = msg.get("udp_port", 0)
+            # Codec for UDP-delivered frames (no in-band codec on that path).
+            self._negotiated_codec = msg.get("codec", "") or ""
             # STAB-06 / Plan 01-08: capability_exchange → streaming.
             try:
                 self.fsm.send("hello_received")

@@ -586,6 +586,9 @@ class ServerHelloMsg:
     # Encoder details for client display
     encoder_backend: str = ""           # "nvenc", "vaapi", "amf", "software"
     available_encoders: dict = field(default_factory=dict)  # codec -> [encoder info]
+    # Task #19: the ACTIVE codec ("h264"/"h265"/"av1"). UDP-delivered frames
+    # carry no in-band codec — the client needs this to decode HEVC/AV1.
+    codec: str = "h264"
     # Phase 2 addition (D-03) — structured color-capability block.
     # ``asdict`` recurses into nested dataclasses so the wire format is
     # ``color_caps: {main10, chroma_422, chroma_444, advertised_pix_fmt,

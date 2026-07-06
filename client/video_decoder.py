@@ -127,42 +127,85 @@ class VideoDecoder:
         # (e.g. quality-tier flip) gets a fresh assertion pass.
         self._format_asserted = False
 
+    # Platform-ordered REAL hwaccel device candidates (task #19). Filtered
+    # against av.codec.hwaccel.hwdevices_available() at init, so only devices
+    # this FFmpeg build actually has are tried.
+    _PLATFORM_HW = {
+        "darwin": ["videotoolbox"],
+        "linux": ["cuda", "vaapi"],
+        "win32": ["d3d11va", "dxva2"],
+    }
+
+    def _av_codec_name(self) -> str:
+        return {"h264": "h264", "h265": "hevc", "av1": "av1"}.get(
+            self._codec_name, "h264")
+
     def _init_decoder(self):
-        """Initialize the best available decoder."""
-        candidates = HW_DECODERS.get(self._codec_name, [("h264", None)])
+        """Initialize the best available decoder — REAL hwaccel (task #19).
 
-        for av_codec_name, hw_type in candidates:
+        PyAV ≥12: ``CodecContext.create(codec, "r", hwaccel=HWAccel(...))``
+        attaches a genuine hw device; PyAV transfers decoded frames back to
+        CPU formats (nv12 / p010le) transparently, so the plane hot path is
+        unchanged. ``allow_software_fallback=False`` means an unsupported
+        profile (e.g. 4:4:4 — no consumer hw decodes High444) fails at
+        DECODE time, not create time: ``_fallback_to_software()`` handles
+        that loudly at runtime.
+        """
+        av_codec_name = self._av_codec_name()
+
+        try:
+            from av.codec.hwaccel import HWAccel, hwdevices_available
+            avail = set(hwdevices_available())
+        except ImportError:
+            avail = set()
+
+        import sys as _sys
+        plat = "linux" if _sys.platform.startswith("linux") else _sys.platform
+        for hw_name in self._PLATFORM_HW.get(plat, []):
+            if hw_name not in avail:
+                continue
             try:
-                codec = av.codec.Codec(av_codec_name, "r")
-                ctx = av.CodecContext.create(codec)
-
-                if hw_type:
-                    # Try to open with hardware device
-                    try:
-                        ctx.open()
-                        # PyAV doesn't have a clean hw_device_ctx API for all backends,
-                        # so we test if it works by keeping the context
-                        self._decoder = ctx
-                        self._hw_type = hw_type
-                        self._initialized = True
-                        logger.info("Video decoder: %s (hw=%s)", av_codec_name, hw_type)
-                        return
-                    except Exception:
-                        continue
-                else:
-                    # Software decode
-                    ctx.open()
-                    self._decoder = ctx
-                    self._hw_type = None
-                    self._initialized = True
-                    logger.info("Video decoder: %s (software)", av_codec_name)
-                    return
-
+                hw = HWAccel(device_type=hw_name, allow_software_fallback=False)
+                ctx = av.CodecContext.create(av_codec_name, "r", hwaccel=hw)
+                if not getattr(ctx, "is_hwaccel", True):
+                    continue  # never claim hw we don't have (honesty contract)
+                self._decoder = ctx
+                self._hw_type = hw_name
+                self._initialized = True
+                logger.info("Video decoder: %s (hw=%s, real hwaccel)",
+                            av_codec_name, hw_name)
+                return
             except Exception as e:
-                logger.debug("Decoder %s (hw=%s) failed: %s", av_codec_name, hw_type, e)
+                logger.debug("hwaccel %s for %s failed: %s", hw_name,
+                             av_codec_name, e)
                 continue
 
-        logger.error("No working decoder found for codec: %s", self._codec_name)
+        self._init_software(av_codec_name)
+
+    def _init_software(self, av_codec_name: str):
+        try:
+            ctx = av.CodecContext.create(av_codec_name, "r")
+            ctx.open()
+            self._decoder = ctx
+            self._hw_type = None
+            self._initialized = True
+            logger.info("Video decoder: %s (software)", av_codec_name)
+        except Exception as e:
+            logger.error("No working decoder for %s: %s", av_codec_name, e)
+
+    def _fallback_to_software(self, reason: str):
+        """Runtime hw→software fallback (loud, honest, once).
+
+        Fires when the hw device rejects the actual stream (profile
+        unsupported — e.g. VideoToolbox handed High444/HEVC-444). The
+        caller re-feeds from the next keyframe; the client's IDR-request
+        path recovers the picture within a GOP.
+        """
+        logger.warning("HW decode (%s) failed on live stream — falling back "
+                       "to software: %s", self._hw_type, reason)
+        self._hw_type = None
+        self._format_asserted = False
+        self._init_software(self._av_codec_name())
 
     @property
     def is_ready(self) -> bool:
@@ -283,12 +326,18 @@ class VideoDecoder:
                 if self._decode_error_count <= 5:
                     logger.warning("Decode: invalid data #%d (%d bytes): %s",
                                    self._decode_error_count, len(encoded_data), e)
+            # Task #19: hw device rejecting the live stream (unsupported
+            # profile, e.g. 4:4:4) — drop to software once, loudly.
+            if self._hw_type is not None:
+                self._fallback_to_software(str(e))
         except Exception as e:  # noqa: BLE001 — match the legacy contract
             if self._frame_count == 0:
                 self._decode_error_count = getattr(self, "_decode_error_count", 0) + 1
                 if self._decode_error_count <= 5:
                     logger.warning("Decode error #%d (%d bytes): %s",
                                    self._decode_error_count, len(encoded_data), e)
+            if self._hw_type is not None:
+                self._fallback_to_software(str(e))
 
         return None
 
