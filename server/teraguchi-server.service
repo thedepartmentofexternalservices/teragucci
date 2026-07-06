@@ -1,7 +1,9 @@
 [Unit]
 Description=Teraguchi Remote Desktop Server
-After=network.target graphical.target
-Wants=graphical.target
+# Depend on our own resilient headless Xorg (provides DISPLAY=:0), not the
+# generic graphical.target — so we own the display lifecycle end to end.
+After=network.target teraguchi-xorg.service
+Requires=teraguchi-xorg.service
 
 [Service]
 Type=simple

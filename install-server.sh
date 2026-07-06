@@ -338,14 +338,34 @@ if [ "$SETUP_SERVICE" = true ]; then
     echo ""
     info "Setting up systemd service..."
 
+    # ── Resilient headless NVIDIA display ────────────────────────
+    # On an NVIDIA host, install a dedicated Xorg service that regenerates its
+    # own config (fresh BusID) into /run on every start and never touches
+    # /etc/X11/xorg.conf — so NVIDIA driver updates can't break the display.
+    # See server/setup-headless-display.sh for the resilience model.
+    XORG_DEP="After=network.target"
+    DISPLAY_ENV=""
+    if command -v nvidia-smi &>/dev/null; then
+        info "NVIDIA GPU detected — installing resilient headless Xorg service..."
+        chmod +x "$INSTALL_DIR/server/setup-headless-display.sh"
+        # Point the unit's /opt/teraguchi paths at the real install dir.
+        sed "s|/opt/teraguchi|$INSTALL_DIR|g" \
+            "$INSTALL_DIR/server/teraguchi-xorg.service" \
+            > "/etc/systemd/system/teraguchi-xorg.service"
+        ok "Headless Xorg service installed: teraguchi-xorg (display :0)"
+        XORG_DEP=$'After=network.target teraguchi-xorg.service\nRequires=teraguchi-xorg.service'
+        DISPLAY_ENV="Environment=DISPLAY=:0"
+    fi
+
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" << SVCEOF
 [Unit]
 Description=Teraguchi Remote Desktop Server
-After=network.target
+$XORG_DEP
 
 [Service]
 Type=simple
 User=root
+$DISPLAY_ENV
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$VENV_DIR/bin/python -m server.main --port 4443 --fps 30 --codec h264 --chroma yuv444
 Restart=on-failure
@@ -364,10 +384,19 @@ SVCEOF
 
     read -rp "  Start the service now? [y/N]: " START_NOW
     if [[ "$START_NOW" =~ ^[Yy] ]]; then
+        # Bring up the display first so the server finds DISPLAY=:0 on start.
+        if [ -f /etc/systemd/system/teraguchi-xorg.service ]; then
+            systemctl enable --now teraguchi-xorg.service
+            ok "Headless display started and enabled on boot"
+        fi
         systemctl enable --now "$SERVICE_NAME"
         ok "Service started and enabled on boot"
     else
-        info "Start later with: sudo systemctl enable --now $SERVICE_NAME"
+        if [ -f /etc/systemd/system/teraguchi-xorg.service ]; then
+            info "Start later with: sudo systemctl enable --now teraguchi-xorg $SERVICE_NAME"
+        else
+            info "Start later with: sudo systemctl enable --now $SERVICE_NAME"
+        fi
     fi
 fi
 

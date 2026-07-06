@@ -1,0 +1,25 @@
+[Unit]
+Description=Teraguchi headless Xorg (NVIDIA GPU, resilient to driver updates)
+Documentation=file:/opt/teraguchi/server/setup-headless-display.sh
+# Start after the NVIDIA stack is up; provide the display before the server.
+After=nvidia-persistenced.service systemd-udev-settle.service
+Before=teraguchi-server.service
+
+[Service]
+Type=simple
+# Clear a stale lock/socket left by a previous crash so a restart isn't wedged
+# by "Server is already active for display 0". We own :0 exclusively, so this is
+# safe. The leading '-' makes it non-fatal if the files are absent.
+ExecStartPre=-/usr/bin/rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+# Regenerate our OWN config into /run on every start (fresh BusID detection).
+# We deliberately do NOT use /etc/X11/xorg.conf, so NVIDIA driver updates that
+# rewrite it never affect us.
+ExecStartPre=/opt/teraguchi/server/setup-headless-display.sh /opt/teraguchi/server/xorg-teraguchi.conf /run/teraguchi/xorg.conf
+ExecStart=/usr/bin/Xorg :0 -config /run/teraguchi/xorg.conf -noreset -novtswitch vt1
+Restart=on-failure
+RestartSec=3
+# Xorg needs root for /dev/dri + VT access on a headless host.
+User=root
+
+[Install]
+WantedBy=multi-user.target
