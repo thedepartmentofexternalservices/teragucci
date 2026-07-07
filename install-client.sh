@@ -46,7 +46,7 @@ echo ""
 # ── Check Python ─────────────────────────────────────────────────
 
 PYTHON=""
-for cmd in python3 python; do
+for cmd in python3 python python3.10; do
     if command -v "$cmd" &>/dev/null; then
         version=$("$cmd" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
         major=$(echo "$version" | cut -d. -f1)
@@ -64,7 +64,7 @@ if [ -z "$PYTHON" ]; then
     echo ""
     if [ "$SYSTEM" = "Darwin" ]; then
         echo "  Install with Homebrew:"
-        echo "    brew install python@3.12"
+        echo "    brew install python@3.10"
         echo ""
         echo "  Or download from: https://www.python.org/downloads/"
     else
